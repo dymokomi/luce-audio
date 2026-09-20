@@ -1,0 +1,4 @@
+## Shared error codes for luce-audio.
+pub let unsupported: ErrorCode = ErrorCode.package(1)
+pub let invalid: ErrorCode = ErrorCode.package(2)
+pub let failed: ErrorCode = ErrorCode.package(3)

@@ -1,0 +1,120 @@
+## NSSound playback of an in-memory 8-bit mono WAV.
+import c
+import memory
+import luce_audio.result as result
+
+extern func objc_getClass(name: c.str) -> void*?
+extern func sel_registerName(name: c.str) -> void*
+extern func objc_autoreleasePoolPush() -> void*
+extern func objc_autoreleasePoolPop(pool: void*)
+extern func msg_ptr as "objc_msgSend"(object: void*, selector: void*) -> void*?
+extern func msg_bytes as "objc_msgSend"(object: void*, selector: void*, bytes: const u8*, length: usize) -> void*?
+extern func msg_init_data as "objc_msgSend"(object: void*, selector: void*, data: void*) -> void*?
+extern func msg_play as "objc_msgSend"(object: void*, selector: void*) -> bool
+extern func msg_void as "objc_msgSend"(object: void*, selector: void*)
+extern func msg_set_bool as "objc_msgSend"(object: void*, selector: void*, value: bool)
+extern func msg_retain as "objc_msgSend"(object: void*, selector: void*) -> void*?
+extern func msg_release as "objc_msgSend"(object: void*, selector: void*)
+
+pub struct Host:
+    var voices: void*?[8]
+    var next: i64
+    var music: void*?
+
+    pub mutating func close():
+        stop_loop(&self)
+        var i: i64 = 0
+        while i < 8:
+            if let voice = self.voices[(usize)i]:
+                msg_void(voice, sel("stop"))
+                msg_release(voice, sel("release"))
+            self.voices[(usize)i] = none
+            i += 1
+
+pub func play(host: Host*, samples: const u8[], rate: i64, bits: i64) -> !:
+    let wav = try make_wav(samples, rate, bits)
+    defer free(wav) in memory.heap
+    let pool = objc_autoreleasePoolPush()
+    defer objc_autoreleasePoolPop(pool)
+    let data_cls = objc_getClass("NSData") else error(result.failed, "NSData is unavailable")
+    let sound_cls = objc_getClass("NSSound") else error(result.failed, "NSSound is unavailable")
+    let data = msg_bytes(data_cls, sel("dataWithBytes:length:"), wav.data, wav.length) else error(result.failed, "could not wrap PCM as NSData")
+    let native = msg_ptr(sound_cls, sel("alloc")) else error(result.failed, "could not allocate NSSound")
+    let voice = msg_init_data(native, sel("initWithData:"), data) else error(result.failed, "could not create NSSound from PCM")
+    let kept = msg_retain(voice, sel("retain")) else error(result.failed, "could not retain NSSound")
+    let slot = host.next % 8
+    host.next += 1
+    if let old = host.voices[(usize)slot]:
+        msg_void(old, sel("stop"))
+        msg_release(old, sel("release"))
+    host.voices[(usize)slot] = kept
+    if not msg_play(voice, sel("play")):
+        error(result.failed, "NSSound.play failed")
+
+pub func stop_loop(host: Host*):
+    if let old = host.music:
+        msg_void(old, sel("stop"))
+        msg_release(old, sel("release"))
+    host.music = none
+
+pub func play_loop(host: Host*, samples: const u8[], rate: i64) -> !:
+    let wav = try make_wav(samples, rate, 16)
+    defer free(wav) in memory.heap
+    let pool = objc_autoreleasePoolPush()
+    defer objc_autoreleasePoolPop(pool)
+    let data_cls = objc_getClass("NSData") else error(result.failed, "NSData is unavailable")
+    let sound_cls = objc_getClass("NSSound") else error(result.failed, "NSSound is unavailable")
+    let data = msg_bytes(data_cls, sel("dataWithBytes:length:"), wav.data, wav.length) else error(result.failed, "could not wrap PCM as NSData")
+    let native = msg_ptr(sound_cls, sel("alloc")) else error(result.failed, "could not allocate NSSound")
+    let voice = msg_init_data(native, sel("initWithData:"), data) else error(result.failed, "could not create NSSound from PCM")
+    let kept = msg_retain(voice, sel("retain")) else error(result.failed, "could not retain NSSound")
+    stop_loop(host)
+    msg_set_bool(kept, sel("setLoops:"), true)
+    msg_set_bool(voice, sel("setLoops:"), true)
+    host.music = kept
+    if not msg_play(kept, sel("play")):
+        if not msg_play(voice, sel("play")):
+            error(result.failed, "NSSound.play failed")
+
+func make_wav(samples: const u8[], rate: i64, bits: i64) -> u8[]!:
+    if bits != 8 and bits != 16:
+        error(result.invalid, "WAV PCM must be 8-bit or 16-bit")
+    let pcm = (i64)samples.length
+    let block = 1 if bits == 8 else 2
+    var wav = try alloc u8[(usize)(44 + pcm)] in memory.heap
+    errdefer free(wav) in memory.heap
+    put_str(wav, 0, b"RIFF")
+    put_u32(wav, 4, (u32)(36 + pcm))
+    put_str(wav, 8, b"WAVE")
+    put_str(wav, 12, b"fmt ")
+    put_u32(wav, 16, 16)
+    put_u16(wav, 20, 1)
+    put_u16(wav, 22, 1)
+    put_u32(wav, 24, (u32)rate)
+    put_u32(wav, 28, (u32)(rate * block))
+    put_u16(wav, 32, (u16)block)
+    put_u16(wav, 34, (u16)bits)
+    put_str(wav, 36, b"data")
+    put_u32(wav, 40, (u32)pcm)
+    var i: usize = 0
+    while i < samples.length:
+        wav[44 + i] = samples[i]
+        i += 1
+    return wav
+
+func put_str(blob: u8[], off: i64, text: const u8[]):
+    var i: usize = 0
+    while i < text.length:
+        blob[(usize)off + i] = text[i]
+        i += 1
+
+func put_u16(blob: u8[], off: i64, value: u16):
+    blob[(usize)off] = (u8)(value % 256)
+    blob[(usize)off + 1] = (u8)(value // 256)
+
+func put_u32(blob: u8[], off: i64, value: u32):
+    put_u16(blob, off, (u16)(value % 65536))
+    put_u16(blob, off + 2, (u16)(value // 65536))
+
+func sel(name: c.str) -> void*:
+    return sel_registerName(name)

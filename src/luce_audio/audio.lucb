@@ -1,0 +1,63 @@
+## Short PCM playback. macOS plays 8-bit mono through NSSound; other hosts fail.
+import c
+import memory
+import platform
+import luce_audio.macos as macos
+import luce_audio.result as result
+
+pub let unsupported: ErrorCode = result.unsupported
+pub let invalid: ErrorCode = result.invalid
+pub let failed: ErrorCode = result.failed
+
+extern func luce_imf_pcm_bytes(imf: const u8*, imf_len: i32, rate: i32) -> i32
+extern func luce_imf_render(imf: const u8*, imf_len: i32, rate: i32, dest: const u8*, dest_len: i32) -> i32
+
+## A process-side mixer that can overlap a few one-shot clips plus one looping song.
+pub struct Player:
+    var host: macos.Host
+
+    pub mutating func close():
+        self.host.close()
+
+    ## Play unsigned 8-bit mono PCM at `rate` Hz.
+    pub mutating func play_pcm8(samples: const u8[], rate: i64) -> !:
+        if samples.length == 0 or rate < 1 or rate > 192000:
+            error(invalid, "PCM must be nonempty 8-bit mono at 1..192000 Hz")
+        if not platform.macos:
+            error(unsupported, "luce-audio plays PCM on macOS")
+        try macos.play(&self.host, samples, rate, 8)
+
+    ## Play little-endian signed 16-bit mono PCM at `rate` Hz.
+    pub mutating func play_pcm16(samples: const u8[], rate: i64) -> !:
+        if samples.length < 2 or samples.length % 2 != 0 or rate < 1 or rate > 192000:
+            error(invalid, "PCM must be nonempty 16-bit mono at 1..192000 Hz")
+        if not platform.macos:
+            error(unsupported, "luce-audio plays PCM on macOS")
+        try macos.play(&self.host, samples, rate, 16)
+
+    ## Loop little-endian signed 16-bit mono PCM (AdLib music).
+    pub mutating func play_pcm16_loop(samples: const u8[], rate: i64) -> !:
+        if samples.length < 2 or samples.length % 2 != 0 or rate < 1 or rate > 192000:
+            error(invalid, "PCM must be nonempty 16-bit mono at 1..192000 Hz")
+        if not platform.macos:
+            error(unsupported, "luce-audio plays PCM on macOS")
+        try macos.play_loop(&self.host, samples, rate)
+
+    pub mutating func stop_loop():
+        macos.stop_loop(&self.host)
+
+## Render one loop of Wolf3D IMF (AdLib) to signed 16-bit mono PCM.
+pub func render_imf(imf: const u8[], rate: i64) -> u8[]!:
+    if imf.length < 4 or rate < 1000 or rate > 48000:
+        error(invalid, "IMF is truncated or the rate is out of range")
+    let bytes = (i64)luce_imf_pcm_bytes(imf.data, (i32)imf.length, (i32)rate)
+    if bytes < 2:
+        error(failed, "IMF produced no PCM")
+    var pcm = try alloc u8[(usize)bytes] in memory.heap
+    errdefer free(pcm) in memory.heap
+    let wrote = luce_imf_render(imf.data, (i32)imf.length, (i32)rate, pcm.data, (i32)bytes)
+    if wrote < 2:
+        error(failed, "IMF render failed")
+    if wrote < bytes:
+        return pcm[0..<(usize)wrote]
+    return pcm

@@ -1,0 +1,11 @@
+[package]
+name = "luce_audio"
+source = "src"
+
+[exports]
+audio = "luce_audio.audio"
+
+[native]
+sources = ["native/fmopl.c", "native/imf.c"]
+frameworks = ["AppKit", "Foundation"]
+libraries = ["objc"]
