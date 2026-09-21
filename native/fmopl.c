@@ -1959,7 +1959,7 @@ static void OPLSetUpdateHandler(FM_OPL *OPL,OPL_UPDATEHANDLER UpdateHandler,int 
 	OPL->UpdateParam = param;
 }
 
-#if defined(BUILD_YM3526) || defined(BUILD_Y8950)
+#if BUILD_YM3526 || BUILD_Y8950
 
 static int OPLWrite(FM_OPL *OPL,int a,int v)
 {
