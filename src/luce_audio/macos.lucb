@@ -1,6 +1,7 @@
 ## NSSound playback of an in-memory 8-bit mono WAV.
 import c
 import memory
+import platform
 import luce_audio.result as result
 
 extern func objc_getClass(name: c.str) -> void*?
@@ -22,6 +23,8 @@ pub struct Host:
     var music: void*?
 
     pub mutating func close():
+        if not platform.macos:
+            return
         stop_loop(&self)
         var i: i64 = 0
         while i < 8:
@@ -32,6 +35,8 @@ pub struct Host:
             i += 1
 
 pub func play(host: Host*, samples: const u8[], rate: i64, bits: i64) -> !:
+    if not platform.macos:
+        error(result.unsupported, "NSSound is only available on macOS")
     let wav = try make_wav(samples, rate, bits)
     defer free(wav) in memory.heap
     let pool = objc_autoreleasePoolPush()
@@ -52,12 +57,16 @@ pub func play(host: Host*, samples: const u8[], rate: i64, bits: i64) -> !:
         error(result.failed, "NSSound.play failed")
 
 pub func stop_loop(host: Host*):
+    if not platform.macos:
+        return
     if let old = host.music:
         msg_void(old, sel("stop"))
         msg_release(old, sel("release"))
     host.music = none
 
 pub func play_loop(host: Host*, samples: const u8[], rate: i64) -> !:
+    if not platform.macos:
+        error(result.unsupported, "NSSound is only available on macOS")
     let wav = try make_wav(samples, rate, 16)
     defer free(wav) in memory.heap
     let pool = objc_autoreleasePoolPush()
