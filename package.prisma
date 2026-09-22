@@ -1,7 +1,8 @@
 #prisma 4.0
 def package "luce-audio" {
     str owner = "dymokomi"
-    str version = "0.1.0"
+    str version = "0.1.1"
+    str kind = "package"
     str language = "luce-base"
     str description = "Short PCM playback for Luce/Base programs. The first backend is macOS (NSSound). Windows and Linux are not implemented yet; play_pcm8 fails with unsupported there."
     str readme = "README.md"
