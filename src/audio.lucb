@@ -2,8 +2,8 @@
 import c
 import memory
 import platform
-import luce_audio.macos as macos
-import luce_audio.result as result
+import macos
+import result
 
 pub let unsupported: ErrorCode = result.unsupported
 pub let invalid: ErrorCode = result.invalid

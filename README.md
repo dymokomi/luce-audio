@@ -12,7 +12,7 @@ luce_audio = "../luce-audio"
 ```
 
 ```luce
-from audio import Player
+from luce_audio.audio import Player
 
 var player = Player()
 defer player.close()

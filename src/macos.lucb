@@ -2,7 +2,7 @@
 import c
 import memory
 import platform
-import luce_audio.result as result
+import result
 
 extern func objc_getClass(name: c.str) -> void*?
 extern func sel_registerName(name: c.str) -> void*
