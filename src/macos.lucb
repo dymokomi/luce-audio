@@ -22,7 +22,7 @@ pub struct Host:
     var next: i64
     var music: void*?
 
-    pub mutating func close():
+    pub func close():
         if not platform.macos:
             return
         stop_loop(&self)
@@ -90,7 +90,7 @@ func make_wav(samples: const u8[], rate: i64, bits: i64) -> u8[]!:
         error(result.invalid, "WAV PCM must be 8-bit or 16-bit")
     let pcm = (i64)samples.length
     let block = 1 if bits == 8 else 2
-    var wav = try alloc u8[(usize)(44 + pcm)] in memory.heap
+    var wav = try new u8[(usize)(44 + pcm)] --- in memory.heap
     errdefer free(wav) in memory.heap
     put_str(wav, 0, b"RIFF")
     put_u32(wav, 4, (u32)(36 + pcm))

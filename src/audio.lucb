@@ -16,11 +16,11 @@ extern func luce_imf_render(imf: const u8*, imf_len: i32, rate: i32, dest: const
 pub struct Player:
     var host: macos.Host
 
-    pub mutating func close():
+    pub func close():
         self.host.close()
 
     ## Play unsigned 8-bit mono PCM at `rate` Hz.
-    pub mutating func play_pcm8(samples: const u8[], rate: i64) -> !:
+    pub func play_pcm8(samples: const u8[], rate: i64) -> !:
         if samples.length == 0 or rate < 1 or rate > 192000:
             error(invalid, "PCM must be nonempty 8-bit mono at 1..192000 Hz")
         if not platform.macos:
@@ -28,7 +28,7 @@ pub struct Player:
         try macos.play(&self.host, samples, rate, 8)
 
     ## Play little-endian signed 16-bit mono PCM at `rate` Hz.
-    pub mutating func play_pcm16(samples: const u8[], rate: i64) -> !:
+    pub func play_pcm16(samples: const u8[], rate: i64) -> !:
         if samples.length < 2 or samples.length % 2 != 0 or rate < 1 or rate > 192000:
             error(invalid, "PCM must be nonempty 16-bit mono at 1..192000 Hz")
         if not platform.macos:
@@ -36,14 +36,14 @@ pub struct Player:
         try macos.play(&self.host, samples, rate, 16)
 
     ## Loop little-endian signed 16-bit mono PCM (AdLib music).
-    pub mutating func play_pcm16_loop(samples: const u8[], rate: i64) -> !:
+    pub func play_pcm16_loop(samples: const u8[], rate: i64) -> !:
         if samples.length < 2 or samples.length % 2 != 0 or rate < 1 or rate > 192000:
             error(invalid, "PCM must be nonempty 16-bit mono at 1..192000 Hz")
         if not platform.macos:
             error(unsupported, "luce-audio plays PCM on macOS")
         try macos.play_loop(&self.host, samples, rate)
 
-    pub mutating func stop_loop():
+    pub func stop_loop():
         macos.stop_loop(&self.host)
 
 ## Render one loop of Wolf3D IMF (AdLib) to signed 16-bit mono PCM.
@@ -53,7 +53,7 @@ pub func render_imf(imf: const u8[], rate: i64) -> u8[]!:
     let bytes = (i64)luce_imf_pcm_bytes(imf.data, (i32)imf.length, (i32)rate)
     if bytes < 2:
         error(failed, "IMF produced no PCM")
-    var pcm = try alloc u8[(usize)bytes] in memory.heap
+    var pcm = try new u8[(usize)bytes] --- in memory.heap
     errdefer free(pcm) in memory.heap
     let wrote = luce_imf_render(imf.data, (i32)imf.length, (i32)rate, pcm.data, (i32)bytes)
     if wrote < 2:
