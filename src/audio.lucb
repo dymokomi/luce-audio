@@ -61,3 +61,35 @@ pub func render_imf(imf: const u8[], rate: i64) -> u8[]!:
     if wrote < bytes:
         return pcm[0..<(usize)wrote]
     return pcm
+
+test "an IMF song renders to one loop of 16-bit PCM":
+    # a type-1 song of 8 bytes: two register writes, 350 ticks each, one second at 700 Hz
+    let song: u8[10] = [0x08, 0x00, 0x20, 0x01, 0x5e, 0x01, 0x40, 0x10, 0x5e, 0x01]
+    let pcm = try render_imf(song, 22050)
+    defer free(pcm) in memory.heap
+    # whole samples per tick: 31 at 22050 Hz, so 700 ticks are 21700 samples
+    assert(pcm.length == 43400)
+
+## Whether `render_imf` refuses `imf` at `rate` as invalid.
+func refuses(imf: const u8[], rate: i64) -> bool:
+    let pcm = render_imf(imf, rate) catch failure:
+        return failure.code == invalid
+    free(pcm) in memory.heap
+    return false
+
+test "a truncated IMF song or a rate out of range is refused":
+    let short: u8[3] = [0, 0, 0]
+    let song: u8[4] = [0x20, 0x01, 0x10, 0x00]
+    assert(refuses(short, 22050) and refuses(song, 100) and refuses(song, 96000))
+
+test "PCM that is empty, odd or at a bad rate is refused before anything plays":
+    var player: Player
+    let odd: u8[3] = [1, 2, 3]
+    var refused = 0
+    player.play_pcm8(odd[0..<0], 8000) catch failure:
+        if failure.code == invalid: refused += 1
+    player.play_pcm16(odd, 8000) catch failure:
+        if failure.code == invalid: refused += 1
+    player.play_pcm16_loop(odd, 0) catch failure:
+        if failure.code == invalid: refused += 1
+    assert(refused == 3)
