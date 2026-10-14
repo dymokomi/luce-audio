@@ -1,0 +1,630 @@
+## The node kinds an instrument's patch is built from: each one's name,
+## category, ports and parameters. The engine runs them (`dsp`, `program`);
+## an application reads this table to offer and draw them, so a kind added
+## here appears in its menus without more work.
+##
+## Every signal is a block of f32 samples. Pitch is in octaves from middle C
+## (note 60 is 0.0, an octave up 1.0), so a pitch and a modulation add.
+## Gates and envelopes run 0..1, bipolar modulation -1..1.
+
+pub struct ParamSpec:
+    pub let name: str
+    pub let minimum: f64
+    pub let maximum: f64
+    pub let initial: f64
+    ## What the value is shown in: "Hz", "s", "ms", "dB", "%", "st", "" (none).
+    pub let units: str
+    ## A menu's items, "Sine|Triangle|Saw|Square"; empty for a number.
+    pub let items: str = ""
+    ## The slider moves on a logarithmic scale (frequencies, times).
+    pub let logarithmic: bool = false
+
+pub struct KindSpec:
+    pub let name: str
+    pub let category: str
+    ## Input and output port names, comma-separated.
+    pub let inputs: str
+    pub let outputs: str
+    ## This kind's parameters: `params[first..<first + count]`.
+    pub let first: u32
+    pub let count: u32
+    pub let doc: str
+
+pub let note_in: u32 = 0
+pub let control_in: u32 = 1
+pub let audio_in: u32 = 2
+pub let output: u32 = 3
+pub let oscillator: u32 = 4
+pub let noise: u32 = 5
+pub let filter: u32 = 6
+pub let envelope: u32 = 7
+pub let lfo: u32 = 8
+pub let mix: u32 = 9
+pub let multiply: u32 = 10
+pub let gain: u32 = 11
+pub let pan: u32 = 12
+pub let drive: u32 = 13
+pub let delay: u32 = 14
+pub let constant: u32 = 15
+pub let glide: u32 = 16
+pub let reverb: u32 = 17
+pub let ladder: u32 = 18
+pub let sem: u32 = 19
+pub let twin: u32 = 20
+pub let ms20: u32 = 21
+pub let analog_vco: u32 = 22
+pub let analog_envelope: u32 = 23
+pub let ota_vca: u32 = 24
+pub let multimode: u32 = 25
+pub let drive2: u32 = 26
+pub let kick: u32 = 27
+pub let snare: u32 = 28
+pub let metal: u32 = 29
+pub let clap: u32 = 30
+pub let tine: u32 = 31
+pub let plate: u32 = 32
+pub let echo: u32 = 33
+pub let chorus: u32 = 34
+pub let compressor: u32 = 35
+pub let tremolo: u32 = 36
+pub let diode_ladder: u32 = 37
+pub let lofi: u32 = 38
+pub let phaser: u32 = 39
+pub let flanger: u32 = 40
+pub let tape: u32 = 41
+pub let pump: u32 = 42
+pub let hall: u32 = 43
+pub let supersaw: u32 = 44
+pub let tempo_lfo: u32 = 45
+pub let width: u32 = 46
+pub let drum_machine: u32 = 47
+pub let freq_shifter: u32 = 48
+pub let eq: u32 = 49
+pub let fm_operator: u32 = 50
+pub let bus_comp: u32 = 51
+pub let limiter: u32 = 52
+pub let scale_quantize: u32 = 53
+pub let count: u32 = 54
+
+pub let most_inputs: usize = 8
+pub let most_outputs: usize = 4
+pub let most_params: usize = 16
+
+pub let params: ParamSpec[305] = [
+    # 0 control_in: 1
+    ParamSpec(name = "Control", minimum = 1.0, maximum = 8.0, initial = 1.0, units = "", items = "1|2|3|4|5|6|7|8"),
+    # 1 output: 1
+    ParamSpec(name = "Gain", minimum = -60.0, maximum = 12.0, initial = 0.0, units = "dB"),
+    # 2 oscillator: 6
+    ParamSpec(name = "Wave", minimum = 0.0, maximum = 3.0, initial = 2.0, units = "", items = "Sine|Triangle|Saw|Square"),
+    ParamSpec(name = "Octave", minimum = -4.0, maximum = 4.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Semitones", minimum = -12.0, maximum = 12.0, initial = 0.0, units = "st"),
+    ParamSpec(name = "Fine", minimum = -100.0, maximum = 100.0, initial = 0.0, units = "ct"),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Pulse Width", minimum = 0.05, maximum = 0.95, initial = 0.5, units = ""),
+    # 8 noise: 1
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    # 9 filter: 3
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 3.0, initial = 0.0, units = "", items = "Low Pass|Band Pass|High Pass|Notch"),
+    ParamSpec(name = "Cutoff", minimum = 20.0, maximum = 20000.0, initial = 2000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Resonance", minimum = 0.0, maximum = 1.0, initial = 0.2, units = ""),
+    # 12 envelope: 4
+    ParamSpec(name = "Attack", minimum = 0.0005, maximum = 10.0, initial = 0.005, units = "s", logarithmic = true),
+    ParamSpec(name = "Decay", minimum = 0.001, maximum = 10.0, initial = 0.3, units = "s", logarithmic = true),
+    ParamSpec(name = "Sustain", minimum = 0.0, maximum = 1.0, initial = 0.7, units = ""),
+    ParamSpec(name = "Release", minimum = 0.001, maximum = 20.0, initial = 0.4, units = "s", logarithmic = true),
+    # 16 lfo: 3
+    ParamSpec(name = "Wave", minimum = 0.0, maximum = 4.0, initial = 0.0, units = "", items = "Sine|Triangle|Saw|Square|Random"),
+    ParamSpec(name = "Rate", minimum = 0.01, maximum = 50.0, initial = 4.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Depth", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 19 mix: 4
+    ParamSpec(name = "Gain A", minimum = 0.0, maximum = 2.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Gain B", minimum = 0.0, maximum = 2.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Gain C", minimum = 0.0, maximum = 2.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Gain D", minimum = 0.0, maximum = 2.0, initial = 1.0, units = ""),
+    # 23 gain: 1
+    ParamSpec(name = "Gain", minimum = -60.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    # 24 pan: 1
+    ParamSpec(name = "Pan", minimum = -1.0, maximum = 1.0, initial = 0.0, units = ""),
+    # 25 drive: 2
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 36.0, initial = 6.0, units = "dB"),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 27 delay: 3
+    ParamSpec(name = "Time", minimum = 1.0, maximum = 2000.0, initial = 375.0, units = "ms", logarithmic = true),
+    ParamSpec(name = "Feedback", minimum = 0.0, maximum = 0.95, initial = 0.35, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    # 30 constant: 1
+    ParamSpec(name = "Value", minimum = -10.0, maximum = 10.0, initial = 0.0, units = ""),
+    # 31 glide: 1
+    ParamSpec(name = "Time", minimum = 0.0, maximum = 2.0, initial = 0.05, units = "s"),
+    # 32 reverb: 3
+    ParamSpec(name = "Size", minimum = 0.0, maximum = 1.0, initial = 0.7, units = ""),
+    ParamSpec(name = "Damping", minimum = 0.0, maximum = 1.0, initial = 0.4, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.25, units = ""),
+    # 35 ladder: 6
+    ParamSpec(name = "Cutoff", minimum = 20.0, maximum = 20000.0, initial = 800.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Resonance", minimum = 0.0, maximum = 1.05, initial = 0.3, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 30.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Bass", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 3.0, initial = 0.0, units = "", items = "LP 24|LP 12|Band|High"),
+    ParamSpec(name = "Slop", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    # 41 sem: 6
+    ParamSpec(name = "Cutoff", minimum = 20.0, maximum = 20000.0, initial = 1000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Resonance", minimum = 0.0, maximum = 1.1, initial = 0.3, units = ""),
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Band", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Notch|Band"),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Slop", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    # 47 cs filter: 6
+    ParamSpec(name = "High Cutoff", minimum = 20.0, maximum = 10000.0, initial = 60.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "High Resonance", minimum = 0.0, maximum = 0.98, initial = 0.1, units = ""),
+    ParamSpec(name = "Low Cutoff", minimum = 20.0, maximum = 20000.0, initial = 1500.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low Resonance", minimum = 0.0, maximum = 0.98, initial = 0.25, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Slop", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    # 53 ms-20: 7
+    ParamSpec(name = "High Cutoff", minimum = 20.0, maximum = 10000.0, initial = 30.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "High Peak", minimum = 0.0, maximum = 0.97, initial = 0.1, units = ""),
+    ParamSpec(name = "Low Cutoff", minimum = 20.0, maximum = 20000.0, initial = 1200.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low Peak", minimum = 0.0, maximum = 1.0, initial = 0.4, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 30.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Flavor", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Korg35|OTA"),
+    ParamSpec(name = "Slop", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    # 60 analog vco: 9
+    ParamSpec(name = "Octave", minimum = -4.0, maximum = 4.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Semitones", minimum = -12.0, maximum = 12.0, initial = 0.0, units = "st"),
+    ParamSpec(name = "Fine", minimum = -100.0, maximum = 100.0, initial = 0.0, units = "ct"),
+    ParamSpec(name = "Shape", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Pulse Width", minimum = 0.02, maximum = 0.98, initial = 0.5, units = ""),
+    ParamSpec(name = "Sub", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Drift", minimum = 0.0, maximum = 20.0, initial = 3.0, units = "ct"),
+    ParamSpec(name = "Phase", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Free|Reset"),
+    # 69 analog envelope: 8
+    ParamSpec(name = "Attack", minimum = 0.0005, maximum = 10.0, initial = 0.005, units = "s", logarithmic = true),
+    ParamSpec(name = "Decay", minimum = 0.002, maximum = 35.0, initial = 0.4, units = "s", logarithmic = true),
+    ParamSpec(name = "Sustain", minimum = 0.0, maximum = 1.0, initial = 0.7, units = ""),
+    ParamSpec(name = "Release", minimum = 0.002, maximum = 35.0, initial = 0.3, units = "s", logarithmic = true),
+    ParamSpec(name = "Curve", minimum = 0.02, maximum = 20.0, initial = 0.3, units = "", logarithmic = true),
+    ParamSpec(name = "Initial", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Peak", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Velocity", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    # 77 ota vca: 5
+    ParamSpec(name = "Gain", minimum = -40.0, maximum = 12.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Response", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Linear|Exponential"),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Asymmetry", minimum = -1.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Bleed", minimum = -120.0, maximum = -40.0, initial = -80.0, units = "dB"),
+    # 82 multimode: 4
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 6.0, initial = 0.0, units = "", items = "LP2|LP1|BP|HP1|HP2|BS|PK"),
+    ParamSpec(name = "Cutoff", minimum = 20.0, maximum = 20000.0, initial = 2000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Resonance", minimum = 0.0, maximum = 0.99, initial = 0.2, units = ""),
+    ParamSpec(name = "Slop", minimum = 0.0, maximum = 1.0, initial = 0.2, units = ""),
+    # 86 drive: 7
+    ParamSpec(name = "Circuit", minimum = 0.0, maximum = 7.0, initial = 1.0, units = "", items = "Boost|Tube|Tape|Mid|Diode|Fuzz|Square|Fold"),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 40.0, initial = 12.0, units = "dB"),
+    ParamSpec(name = "Bias", minimum = -1.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Low Cut", minimum = 5.0, maximum = 2000.0, initial = 30.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "High Cut", minimum = 500.0, maximum = 20000.0, initial = 12000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Output", minimum = -40.0, maximum = 12.0, initial = -6.0, units = "dB"),
+    # 93 kick: 10
+    ParamSpec(name = "Model", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "808|909"),
+    ParamSpec(name = "Tune", minimum = 25.0, maximum = 200.0, initial = 50.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Decay", minimum = 0.05, maximum = 4.0, initial = 0.6, units = "s", logarithmic = true),
+    ParamSpec(name = "Sweep", minimum = 0.0, maximum = 4.0, initial = 1.2, units = ""),
+    ParamSpec(name = "Sweep Time", minimum = 0.001, maximum = 0.3, initial = 0.012, units = "s", logarithmic = true),
+    ParamSpec(name = "Sigh", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Tick", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Tone", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.8, units = ""),
+    # 103 snare: 9
+    ParamSpec(name = "Model", minimum = 0.0, maximum = 2.0, initial = 0.0, units = "", items = "808|909|Tom"),
+    ParamSpec(name = "Tune", minimum = 60.0, maximum = 600.0, initial = 180.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Decay", minimum = 0.02, maximum = 2.0, initial = 0.15, units = "s", logarithmic = true),
+    ParamSpec(name = "Snappy", minimum = 0.0, maximum = 1.0, initial = 0.6, units = ""),
+    ParamSpec(name = "Noise Tone", minimum = 200.0, maximum = 16000.0, initial = 5000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Noise Decay", minimum = 0.01, maximum = 2.0, initial = 0.18, units = "s", logarithmic = true),
+    ParamSpec(name = "Sweep", minimum = 0.0, maximum = 2.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.8, units = ""),
+    # 112 metal: 6
+    ParamSpec(name = "Model", minimum = 0.0, maximum = 2.0, initial = 0.0, units = "", items = "Hat|Cymbal|Cowbell"),
+    ParamSpec(name = "Tune", minimum = 0.5, maximum = 2.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Decay", minimum = 0.01, maximum = 6.0, initial = 0.12, units = "s", logarithmic = true),
+    ParamSpec(name = "Tone", minimum = 0.0, maximum = 1.0, initial = 0.85, units = ""),
+    ParamSpec(name = "Color", minimum = 500.0, maximum = 16000.0, initial = 7000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.7, units = ""),
+    # 118 clap: 8
+    ParamSpec(name = "Rate", minimum = 0.002, maximum = 0.05, initial = 0.011, units = "s"),
+    ParamSpec(name = "Number", minimum = 1.0, maximum = 8.0, initial = 4.0, units = ""),
+    ParamSpec(name = "Random", minimum = 0.0, maximum = 1.0, initial = 0.2, units = ""),
+    ParamSpec(name = "Decay", minimum = 0.01, maximum = 1.0, initial = 0.12, units = "s", logarithmic = true),
+    ParamSpec(name = "Tone", minimum = 300.0, maximum = 8000.0, initial = 1100.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Tail Decay", minimum = 0.01, maximum = 2.0, initial = 0.15, units = "s", logarithmic = true),
+    ParamSpec(name = "Tail Level", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.8, units = ""),
+    # 126 tine piano: 10
+    ParamSpec(name = "Bell", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Bell Decay", minimum = 0.02, maximum = 4.0, initial = 0.35, units = "s", logarithmic = true),
+    ParamSpec(name = "Hardness", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Symmetry", minimum = -1.0, maximum = 1.0, initial = 0.35, units = ""),
+    ParamSpec(name = "Reach", minimum = 0.05, maximum = 3.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Decay", minimum = 0.05, maximum = 4.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Release", minimum = 0.02, maximum = 4.0, initial = 0.15, units = "s", logarithmic = true),
+    ParamSpec(name = "Tone", minimum = 500.0, maximum = 16000.0, initial = 5000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 2.0, initial = 0.8, units = ""),
+    # 136 plate: 10
+    ParamSpec(name = "Decay", minimum = 0.2, maximum = 60.0, initial = 3.0, units = "s", logarithmic = true),
+    ParamSpec(name = "Size", minimum = 0.3, maximum = 2.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Predelay", minimum = 0.0, maximum = 500.0, initial = 20.0, units = "ms"),
+    ParamSpec(name = "Damping", minimum = 0.0, maximum = 0.95, initial = 0.3, units = ""),
+    ParamSpec(name = "Density", minimum = 0.0, maximum = 1.0, initial = 0.8, units = ""),
+    ParamSpec(name = "Mod Depth", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Mod Rate", minimum = 0.05, maximum = 5.0, initial = 0.8, units = "Hz"),
+    ParamSpec(name = "Low Cut", minimum = 10.0, maximum = 1000.0, initial = 80.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Vintage", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Off|On"),
+    # 146 echo: 10
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 2.0, initial = 0.0, units = "", items = "Tape|BBD|Digital"),
+    ParamSpec(name = "Time", minimum = 0.005, maximum = 2.1, initial = 0.375, units = "s", logarithmic = true),
+    ParamSpec(name = "Feedback", minimum = 0.0, maximum = 1.1, initial = 0.4, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Tone", minimum = 300.0, maximum = 18000.0, initial = 4500.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low Cut", minimum = 10.0, maximum = 2000.0, initial = 120.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Wow", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Flutter", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 3.0, units = "dB"),
+    ParamSpec(name = "Ping-Pong", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Off|On"),
+    # 156 chorus: 5
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 4.0, initial = 0.0, units = "", items = "Juno I|Juno II|Juno I+II|Dimension|Ensemble"),
+    ParamSpec(name = "Rate", minimum = 0.1, maximum = 10.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Depth", minimum = 0.0, maximum = 3.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Tone", minimum = 1000.0, maximum = 20000.0, initial = 15000.0, units = "Hz", logarithmic = true),
+    # 161 compressor: 9
+    ParamSpec(name = "Threshold", minimum = -60.0, maximum = 0.0, initial = -18.0, units = "dB"),
+    ParamSpec(name = "Ratio", minimum = 1.0, maximum = 20.0, initial = 4.0, units = ""),
+    ParamSpec(name = "Attack", minimum = 0.05, maximum = 200.0, initial = 10.0, units = "ms", logarithmic = true),
+    ParamSpec(name = "Release", minimum = 5.0, maximum = 2000.0, initial = 150.0, units = "ms", logarithmic = true),
+    ParamSpec(name = "Knee", minimum = 0.0, maximum = 24.0, initial = 6.0, units = "dB"),
+    ParamSpec(name = "Makeup", minimum = -12.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Squash", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Grit", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 170 tremolo: 4
+    ParamSpec(name = "Rate", minimum = 0.05, maximum = 20.0, initial = 4.5, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Depth", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Shape", minimum = 0.0, maximum = 1.0, initial = 0.2, units = ""),
+    ParamSpec(name = "Stereo", minimum = 0.0, maximum = 1.0, initial = 1.0, units = "", items = "Mono|Stereo"),
+    # 174 diode ladder: 6
+    ParamSpec(name = "Cutoff", minimum = 20.0, maximum = 20000.0, initial = 500.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Resonance", minimum = 0.0, maximum = 1.3, initial = 0.6, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 30.0, initial = 3.0, units = "dB"),
+    ParamSpec(name = "Core", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "303|VCS3"),
+    ParamSpec(name = "Feedback HP", minimum = 5.0, maximum = 1000.0, initial = 80.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Slop", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    # 180 lo-fi: 7
+    ParamSpec(name = "Bits", minimum = 1.0, maximum = 16.0, initial = 8.0, units = ""),
+    ParamSpec(name = "Rate", minimum = 50.0, maximum = 48000.0, initial = 12000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Jitter", minimum = 0.0, maximum = 1.0, initial = 0.1, units = ""),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 24.0, initial = 3.0, units = "dB"),
+    ParamSpec(name = "Cutoff", minimum = 50.0, maximum = 20000.0, initial = 8000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Resonance", minimum = 0.0, maximum = 0.97, initial = 0.2, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 187 phaser: 8
+    ParamSpec(name = "Stages", minimum = 0.0, maximum = 3.0, initial = 1.0, units = "", items = "4|6|8|12"),
+    ParamSpec(name = "Rate", minimum = 0.01, maximum = 10.0, initial = 0.4, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low", minimum = 20.0, maximum = 5000.0, initial = 200.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "High", minimum = 100.0, maximum = 16000.0, initial = 3500.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Feedback", minimum = -0.95, maximum = 0.95, initial = 0.5, units = ""),
+    ParamSpec(name = "Spread", minimum = 0.0, maximum = 0.5, initial = 0.25, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Barberpole", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Off|On"),
+    # 195 flanger: 7
+    ParamSpec(name = "Delay", minimum = 0.1, maximum = 10.0, initial = 2.5, units = "ms"),
+    ParamSpec(name = "Depth", minimum = 0.0, maximum = 10.0, initial = 2.0, units = "ms"),
+    ParamSpec(name = "Rate", minimum = 0.01, maximum = 10.0, initial = 0.2, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Feedback", minimum = -0.95, maximum = 0.95, initial = 0.6, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Through-Zero", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Off|On"),
+    ParamSpec(name = "Spread", minimum = 0.0, maximum = 0.5, initial = 0.25, units = ""),
+    # 202 tape: 8
+    ParamSpec(name = "Mode", minimum = 0.0, maximum = 2.0, initial = 0.0, units = "", items = "Studio|Cassette|VHS"),
+    ParamSpec(name = "Drive", minimum = -12.0, maximum = 30.0, initial = 3.0, units = "dB"),
+    ParamSpec(name = "Wow", minimum = 0.0, maximum = 1.0, initial = 0.25, units = ""),
+    ParamSpec(name = "Flutter", minimum = 0.0, maximum = 1.0, initial = 0.25, units = ""),
+    ParamSpec(name = "Bump", minimum = 0.0, maximum = 9.0, initial = 2.0, units = "dB"),
+    ParamSpec(name = "Tone", minimum = 1000.0, maximum = 20000.0, initial = 14000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Hiss", minimum = -120.0, maximum = -20.0, initial = -72.0, units = "dB"),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 210 pump: 8
+    ParamSpec(name = "Rate", minimum = 0.0, maximum = 5.0, initial = 2.0, units = "", items = "1/16|1/8|1/4|1/2|1 bar|2 bars"),
+    ParamSpec(name = "Depth", minimum = 0.0, maximum = 1.0, initial = 0.6, units = ""),
+    ParamSpec(name = "Release", minimum = 0.02, maximum = 1.0, initial = 0.6, units = ""),
+    ParamSpec(name = "Curve", minimum = 0.3, maximum = 6.0, initial = 2.0, units = ""),
+    ParamSpec(name = "Attack", minimum = 0.0, maximum = 50.0, initial = 3.0, units = "ms"),
+    ParamSpec(name = "Offset", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Threshold", minimum = -60.0, maximum = 0.0, initial = -20.0, units = "dB"),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 218 hall: 11
+    ParamSpec(name = "Decay", minimum = 0.1, maximum = 60.0, initial = 3.5, units = "s", logarithmic = true),
+    ParamSpec(name = "Size", minimum = 0.2, maximum = 2.5, initial = 1.0, units = ""),
+    ParamSpec(name = "Predelay", minimum = 0.0, maximum = 299.0, initial = 20.0, units = "ms"),
+    ParamSpec(name = "Damping", minimum = 500.0, maximum = 20000.0, initial = 6000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Mod Depth", minimum = 0.0, maximum = 1.0, initial = 0.4, units = ""),
+    ParamSpec(name = "Mod Rate", minimum = 0.01, maximum = 5.0, initial = 0.5, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low Cut", minimum = 10.0, maximum = 1000.0, initial = 120.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Width", minimum = 0.0, maximum = 2.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Gate", minimum = 0.0, maximum = 2.0, initial = 0.0, units = "s"),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Shimmer", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    # 229 supersaw: 8
+    ParamSpec(name = "Octave", minimum = -4.0, maximum = 4.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Semitones", minimum = -12.0, maximum = 12.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Fine", minimum = -100.0, maximum = 100.0, initial = 0.0, units = "cents"),
+    ParamSpec(name = "Detune", minimum = 0.0, maximum = 1.0, initial = 0.35, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.6, units = ""),
+    ParamSpec(name = "Spread", minimum = 0.0, maximum = 1.0, initial = 0.8, units = ""),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 1.0, initial = 0.6, units = ""),
+    ParamSpec(name = "Drift", minimum = 0.0, maximum = 20.0, initial = 2.0, units = "cents"),
+    # 237 tempo lfo: 5
+    ParamSpec(name = "Wave", minimum = 0.0, maximum = 6.0, initial = 0.0, units = "", items = "Sine|Triangle|Ramp Up|Ramp Down|Square|Random|Smooth Random"),
+    ParamSpec(name = "Rate", minimum = 0.0, maximum = 9.0, initial = 5.0, units = "", items = "1/32|1/16T|1/16|1/8T|1/8|1/4|1/2|1 bar|2 bars|4 bars"),
+    ParamSpec(name = "Phase", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Depth", minimum = -4.0, maximum = 4.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Unipolar", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Off|On"),
+    # 242 width: 4
+    ParamSpec(name = "Width", minimum = 0.0, maximum = 3.0, initial = 1.3, units = ""),
+    ParamSpec(name = "Mono Bass", minimum = 10.0, maximum = 500.0, initial = 150.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Haas", minimum = 0.0, maximum = 30.0, initial = 0.0, units = "ms"),
+    ParamSpec(name = "Balance", minimum = -1.0, maximum = 1.0, initial = 0.0, units = ""),
+    # 246 drum machine: 7
+    ParamSpec(name = "Model", minimum = 0.0, maximum = 9.0, initial = 0.0, units = "", items = "Kick|Snare|Tom|Closed Hat|Open Hat|Clap|Rim|Tambourine|Shaker|Cowbell"),
+    ParamSpec(name = "Tune", minimum = -24.0, maximum = 24.0, initial = 0.0, units = "st"),
+    ParamSpec(name = "Decay", minimum = 0.1, maximum = 4.0, initial = 1.0, units = "", logarithmic = true),
+    ParamSpec(name = "Tone", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Bits", minimum = 3.0, maximum = 16.0, initial = 8.0, units = ""),
+    ParamSpec(name = "Clock", minimum = 4.0, maximum = 96.0, initial = 27.5, units = "kHz", logarithmic = true),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 2.0, initial = 0.9, units = ""),
+    # 253 freq shifter: 4
+    ParamSpec(name = "Shift", minimum = -1000.0, maximum = 1000.0, initial = 8.0, units = "Hz"),
+    ParamSpec(name = "Feedback", minimum = 0.0, maximum = 0.95, initial = 0.0, units = ""),
+    ParamSpec(name = "Spread", minimum = 0.0, maximum = 1.0, initial = 1.0, units = "", items = "Off|On"),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    # 257 eq: 14
+    ParamSpec(name = "Low Cut", minimum = 10.0, maximum = 2000.0, initial = 10.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low Freq", minimum = 20.0, maximum = 1000.0, initial = 120.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Low Gain", minimum = -24.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Mid 1 Freq", minimum = 20.0, maximum = 20000.0, initial = 400.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Mid 1 Gain", minimum = -24.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Mid 1 Q", minimum = 0.1, maximum = 18.0, initial = 1.0, units = "", logarithmic = true),
+    ParamSpec(name = "Mid 2 Freq", minimum = 20.0, maximum = 20000.0, initial = 3000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Mid 2 Gain", minimum = -24.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Mid 2 Q", minimum = 0.1, maximum = 18.0, initial = 1.0, units = "", logarithmic = true),
+    ParamSpec(name = "High Freq", minimum = 500.0, maximum = 20000.0, initial = 8000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "High Gain", minimum = -24.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "High Cut", minimum = 500.0, maximum = 22000.0, initial = 22000.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Slope", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "12 dB|24 dB"),
+    ParamSpec(name = "Output", minimum = -24.0, maximum = 24.0, initial = 0.0, units = "dB"),
+    # 271 fm operator: 11
+    ParamSpec(name = "Ratio", minimum = 0.125, maximum = 32.0, initial = 1.0, units = "", logarithmic = true),
+    ParamSpec(name = "Detune", minimum = -100.0, maximum = 100.0, initial = 0.0, units = "cents"),
+    ParamSpec(name = "Level", minimum = 0.0, maximum = 4.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Attack", minimum = 0.0005, maximum = 20.0, initial = 0.001, units = "s", logarithmic = true),
+    ParamSpec(name = "Decay", minimum = 0.005, maximum = 60.0, initial = 1.5, units = "s", logarithmic = true),
+    ParamSpec(name = "Sustain", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Release", minimum = 0.005, maximum = 60.0, initial = 0.5, units = "s", logarithmic = true),
+    ParamSpec(name = "Feedback", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Velocity", minimum = 0.0, maximum = 1.0, initial = 0.5, units = ""),
+    ParamSpec(name = "Key Scale", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Fixed", minimum = 0.0, maximum = 8000.0, initial = 0.0, units = "Hz"),
+    # 282 bus comp: 13
+    ParamSpec(name = "Model", minimum = 0.0, maximum = 3.0, initial = 0.0, units = "", items = "VCA|FET|Opto|Vari-Mu"),
+    ParamSpec(name = "Threshold", minimum = -60.0, maximum = 0.0, initial = -18.0, units = "dB"),
+    ParamSpec(name = "Ratio", minimum = 1.0, maximum = 30.0, initial = 4.0, units = "", logarithmic = true),
+    ParamSpec(name = "Attack", minimum = 0.02, maximum = 200.0, initial = 10.0, units = "ms", logarithmic = true),
+    ParamSpec(name = "Release", minimum = 10.0, maximum = 5000.0, initial = 300.0, units = "ms", logarithmic = true),
+    ParamSpec(name = "Auto", minimum = 0.0, maximum = 1.0, initial = 0.0, units = "", items = "Off|On"),
+    ParamSpec(name = "Knee", minimum = 0.0, maximum = 24.0, initial = 4.0, units = "dB"),
+    ParamSpec(name = "Side HPF", minimum = 10.0, maximum = 1000.0, initial = 10.0, units = "Hz", logarithmic = true),
+    ParamSpec(name = "Detect", minimum = 0.0, maximum = 1.0, initial = 0.3, units = ""),
+    ParamSpec(name = "Link", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    ParamSpec(name = "Makeup", minimum = -24.0, maximum = 30.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Drive", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Mix", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 295 limiter: 7
+    ParamSpec(name = "Input", minimum = -12.0, maximum = 30.0, initial = 0.0, units = "dB"),
+    ParamSpec(name = "Ceiling", minimum = -24.0, maximum = 0.0, initial = -1.0, units = "dB"),
+    ParamSpec(name = "Release", minimum = 1.0, maximum = 2000.0, initial = 80.0, units = "ms", logarithmic = true),
+    ParamSpec(name = "Lookahead", minimum = 0.1, maximum = 5.0, initial = 2.0, units = "ms"),
+    ParamSpec(name = "Auto", minimum = 0.0, maximum = 1.0, initial = 1.0, units = "", items = "Off|On"),
+    ParamSpec(name = "Soft Clip", minimum = 0.0, maximum = 1.0, initial = 0.0, units = ""),
+    ParamSpec(name = "Link", minimum = 0.0, maximum = 1.0, initial = 1.0, units = ""),
+    # 302 scale_quantize: 3
+    ParamSpec(name = "Scale", minimum = 0.0, maximum = 19.0, initial = 0.0, units = "", items = "Track|Chromatic|Major|Minor|Dorian|Phrygian|Lydian|Mixolydian|Locrian|Harmonic Minor|Melodic Minor|Major Pentatonic|Minor Pentatonic|Blues|Whole Tone|Diminished|Phrygian Dominant|Hungarian Minor|Hirajoshi|In Sen"),
+    ParamSpec(name = "Root", minimum = 0.0, maximum = 11.0, initial = 0.0, units = "", items = "C|C♯|D|E♭|E|F|F♯|G|A♭|A|B♭|B"),
+    ParamSpec(name = "Degrees", minimum = -14.0, maximum = 14.0, initial = 0.0, units = ""),
+]
+
+pub let kinds: KindSpec[54] = [
+    KindSpec(name = "Note In", category = "Inputs", inputs = "", outputs = "pitch,gate,velocity,pan", first = 0, count = 0,
+             doc = "The voice's note: pitch in octaves from middle C, gate while held, velocity and the clip's pan."),
+    KindSpec(name = "Control In", category = "Inputs", inputs = "", outputs = "value", first = 0, count = 1,
+             doc = "One of the instrument's eight control inputs: a curve lane wired to it on the track."),
+    KindSpec(name = "Audio In", category = "Inputs", inputs = "", outputs = "left,right", first = 0, count = 0,
+             doc = "The audio wired into this instrument on the track: an effect's input."),
+    KindSpec(name = "Output", category = "Inputs", inputs = "left,right", outputs = "", first = 1, count = 1,
+             doc = "What the instrument plays; a lone left input plays in both channels."),
+    KindSpec(name = "Oscillator", category = "Sources", inputs = "pitch,phase,width", outputs = "out", first = 2, count = 6,
+             doc = "A band-limited sine, triangle, saw or pulse at the pitch input; phase modulation makes FM tones."),
+    KindSpec(name = "Noise", category = "Sources", inputs = "", outputs = "out", first = 8, count = 1,
+             doc = "White noise."),
+    KindSpec(name = "Filter", category = "Filters", inputs = "in,cutoff,resonance", outputs = "out", first = 9, count = 3,
+             doc = "A state-variable filter; the cutoff input moves the cutoff in octaves."),
+    KindSpec(name = "Envelope", category = "Modulation", inputs = "gate", outputs = "out", first = 12, count = 4,
+             doc = "Attack, decay, sustain and release, from 0 to 1 and back, started by the gate."),
+    KindSpec(name = "LFO", category = "Modulation", inputs = "rate", outputs = "out", first = 16, count = 3,
+             doc = "A slow oscillator from -1 to 1; the rate input moves its rate in octaves."),
+    KindSpec(name = "Mix", category = "Utilities", inputs = "a,b,c,d", outputs = "out", first = 19, count = 4,
+             doc = "The sum of four inputs, each with its gain."),
+    KindSpec(name = "Multiply", category = "Utilities", inputs = "a,b", outputs = "out", first = 0, count = 0,
+             doc = "A times B: an amplifier when B is an envelope."),
+    KindSpec(name = "Gain", category = "Utilities", inputs = "in,amount", outputs = "out", first = 23, count = 1,
+             doc = "The input louder or softer; a wired amount multiplies it again."),
+    KindSpec(name = "Pan", category = "Utilities", inputs = "in,pan", outputs = "left,right", first = 24, count = 1,
+             doc = "One channel to two at equal power; the pan input adds to the setting."),
+    KindSpec(name = "Soft Clip", category = "Effects", inputs = "in", outputs = "out", first = 25, count = 2,
+             doc = "Soft saturation."),
+    KindSpec(name = "Simple Delay", category = "Effects", inputs = "in", outputs = "out", first = 27, count = 3,
+             doc = "An echo up to two seconds long."),
+    KindSpec(name = "Constant", category = "Utilities", inputs = "", outputs = "out", first = 30, count = 1,
+             doc = "A fixed value."),
+    KindSpec(name = "Glide", category = "Modulation", inputs = "in", outputs = "out", first = 31, count = 1,
+             doc = "Follows its input slowly: portamento on a pitch."),
+    KindSpec(name = "Room", category = "Effects", inputs = "left,right", outputs = "left,right", first = 32, count = 3,
+             doc = "A stereo room."),
+    KindSpec(name = "Ladder", category = "Filters", inputs = "in,cutoff,resonance", outputs = "out", first = 35, count = 6,
+             doc = "A Moog-style 4-pole transistor ladder: resonance sings to self-oscillation and thins the bass (Bass puts it back); Drive pushes it into its saturation."),
+    KindSpec(name = "SEM", category = "Filters", inputs = "in,cutoff,resonance,mode", outputs = "out", first = 41, count = 6,
+             doc = "The Oberheim SEM / OB-6 2-pole state-variable filter: Mode sweeps low pass through notch to high pass (Band: through band pass); creamy resonance that compresses rather than screams."),
+    KindSpec(name = "CS Filter", category = "Filters", inputs = "in,cutoff,low", outputs = "out", first = 47, count = 6,
+             doc = "The Yamaha CS-80's filter: a resonant 12 dB high pass into a resonant 12 dB low pass; the cutoff input moves both, the low input only the low pass."),
+    KindSpec(name = "MS-20", category = "Filters", inputs = "in,cutoff,low", outputs = "out", first = 53, count = 7,
+             doc = "The Korg MS-20 pair: a resonant high pass into the Korg35 low pass with a diode clipper in its loop; turn the low Peak up for the scream. Flavor: Korg35 (all distorts) or OTA (only the peak)."),
+    KindSpec(name = "Analog VCO", category = "Sources", inputs = "pitch,fm,phase,width,sync", outputs = "out", first = 60, count = 9,
+             doc = "An analog oscillator: Shape morphs triangle, saw and pulse (Pulse Width also skews the triangle, the Minimoog's shark tooth); a sub an octave down; Drift lets it wander as real VCOs do; sync restarts it."),
+    KindSpec(name = "Analog Envelope", category = "Modulation", inputs = "gate,velocity", outputs = "out", first = 69, count = 8,
+             doc = "An analog ADSR: the attack charges toward past its peak (snappy, as a CEM3310's), decay and release fall exponentially; a retrigger starts from where it is. Initial and Peak are the CS-80's levels."),
+    KindSpec(name = "OTA VCA", category = "Utilities", inputs = "in,cv", outputs = "out", first = 77, count = 5,
+             doc = "An analog VCA: the cv opens it linearly (an OTA) or exponentially (a Blackmer cell); Drive saturates it as an OTA does, Asymmetry adds even harmonics; closed, it bleeds a whisper."),
+    KindSpec(name = "Multimode", category = "Filters", inputs = "in,cutoff,resonance", outputs = "out", first = 82, count = 4,
+             doc = "The Elektron 2-pole multimode (Rytm, A4 filter 2, Analog Heat): LP2, LP1, BP, HP1, HP2, BS and PK from one state-variable filter."),
+    KindSpec(name = "Drive", category = "Effects", inputs = "in,drive", outputs = "out", first = 86, count = 7,
+             doc = "Analog drive after the OTO BOUM and Elektron Analog Heat: a low cut into one of eight circuits, then a 12 dB high cut and a mix. Bias (SYM) makes it asymmetric."),
+    KindSpec(name = "Kick", category = "Drums", inputs = "gate,velocity,pitch", outputs = "out", first = 93, count = 10,
+             doc = "An analog kick: 808, a pinged resonator whose pitch jumps then sighs; 909, a shaped triangle swept down with a click. Velocity is the accent."),
+    KindSpec(name = "Snare", category = "Drums", inputs = "gate,velocity,pitch", outputs = "out", first = 103, count = 9,
+             doc = "An analog snare (808: two modes, 909: five) with snappy noise, or a tom (one mode)."),
+    KindSpec(name = "Metal", category = "Drums", inputs = "gate,velocity", outputs = "out", first = 112, count = 6,
+             doc = "Hats, cymbals and cowbell after the 808: six detuned squares through a band pass and a swing VCA."),
+    KindSpec(name = "Clap", category = "Drums", inputs = "gate,velocity", outputs = "out", first = 118, count = 8,
+             doc = "The 808 clap: band-passed noise in a train of fast bursts, then a tail."),
+    KindSpec(name = "Tine Piano", category = "Sources", inputs = "pitch,gate,velocity", outputs = "out", first = 126, count = 10,
+             doc = "A Rhodes: struck tine modes read by the electromagnetic pickup's curve, so playing harder barks; Symmetry is the tine's place before the pickup (0 on axis: bell-like, off axis: more fundamental)."),
+    KindSpec(name = "Plate", category = "Effects", inputs = "left,right", outputs = "left,right", first = 136, count = 10,
+             doc = "A plate reverb after Dattorro and the Lexicon 224: chorused tank, long decays; Vintage runs it at half rate for the dark Blade Runner / Mercury7 tail."),
+    KindSpec(name = "Echo", category = "Effects", inputs = "left,right,time", outputs = "left,right", first = 146, count = 10,
+             doc = "Tape (Space Echo: gliding time, wow, flutter, warming repeats), BBD (darker as it grows longer) or digital echo; Ping-Pong crosses the repeats."),
+    KindSpec(name = "Chorus", category = "Effects", inputs = "left,right", outputs = "left,right", first = 156, count = 5,
+             doc = "BBD chorus: Juno I, II and I+II, a Dimension-style shimmer, or a three-tap string Ensemble."),
+    KindSpec(name = "Compressor", category = "Effects", inputs = "left,right,key", outputs = "left,right", first = 161, count = 9,
+             doc = "A soft-knee compressor; Squash is OTO BOUM's one knob (past the middle the ratio turns negative), Grit saturates as it squeezes."),
+    KindSpec(name = "Tremolo", category = "Effects", inputs = "left,right", outputs = "left,right", first = 170, count = 4,
+             doc = "The Rhodes Suitcase vibrato: a stereo autopan (or mono tremolo) through a light-dependent resistor's lag."),
+    KindSpec(name = "Diode Ladder", category = "Filters", inputs = "in,cutoff,resonance", outputs = "out", first = 174, count = 6,
+             doc = "A diode ladder (TB-303 or EMS VCS3): unevenly spread poles and a high pass in the feedback, the acid squelch."),
+    KindSpec(name = "Lo-Fi", category = "Effects", inputs = "in,rate", outputs = "out", first = 180, count = 7,
+             doc = "OTO BISCUIT / BIM style degradation: diode-clipped input, a dropped sample rate with jitter, fewer bits, a resonant low pass."),
+    KindSpec(name = "Phaser", category = "Effects", inputs = "left,right", outputs = "left,right", first = 187, count = 8,
+             doc = "A stereo phaser: allpass stages swept between Low and High with feedback; Barberpole sweeps endlessly one way."),
+    KindSpec(name = "Flanger", category = "Effects", inputs = "left,right", outputs = "left,right", first = 195, count = 7,
+             doc = "A flanger: a short swept delay fed back positive or negative; Through-Zero makes the tape-flange null."),
+    KindSpec(name = "Tape", category = "Effects", inputs = "left,right", outputs = "left,right", first = 202, count = 8,
+             doc = "A tape machine: a saturating head, wow and flutter, the low head bump, the top rolling off, hiss. Studio, Cassette or VHS."),
+    KindSpec(name = "Pump", category = "Effects", inputs = "left,right,key", outputs = "left,right", first = 210, count = 8,
+             doc = "The French-touch pump: ducks on every beat (or other step) of the song and swells back, as if keyed by the kick; wire key to follow a signal instead."),
+    KindSpec(name = "Hall", category = "Effects", inputs = "left,right", outputs = "left,right", first = 218, count = 11,
+             doc = "A big hall: diffusion into an eight-line feedback network with swung delays. Gate cuts the tail that long after the input stops (the 80s gated snare)."),
+    KindSpec(name = "Supersaw", category = "Sources", inputs = "pitch,fm,detune", outputs = "left,right", first = 229, count = 8,
+             doc = "The JP-8000 supersaw: seven detuned saws (Szabo's measured detune and mix curves) spread across the stereo field."),
+    KindSpec(name = "Tempo LFO", category = "Modulation", inputs = "", outputs = "out", first = 237, count = 5,
+             doc = "An LFO locked to the song's beat: one cycle every 1/32 note to 4 bars; sine, triangle, ramps, square, sample-and-hold, smooth random."),
+    KindSpec(name = "Width", category = "Effects", inputs = "left,right", outputs = "left,right", first = 242, count = 4,
+             doc = "Stereo width: mid/side (0 mono, 2 twice as wide), lows kept centred below Mono Bass, a Haas delay to widen a mono part."),
+    KindSpec(name = "Drum Machine", category = "Drums", inputs = "gate,velocity,pitch", outputs = "out", first = 246, count = 7,
+             doc = "An early-80s sample drum machine (LinnDrum, DMX, DrumTraks): each drum played from 8-bit μ-law words at its own clock, so tuning moves pitch and length together."),
+    KindSpec(name = "Freq Shifter", category = "Effects", inputs = "left,right,shift", outputs = "left,right", first = 253, count = 4,
+             doc = "A frequency shifter: every partial moves by Shift Hz (a few Hz swirls, tens of Hz turn metallic); Spread shifts the right side the other way."),
+    KindSpec(name = "EQ", category = "Effects", inputs = "left,right", outputs = "left,right", first = 257, count = 14,
+             doc = "A channel EQ for making room in a mix: low and high cut (12 or 24 dB/oct), low and high shelves, two bells."),
+    KindSpec(name = "FM Operator", category = "Sources", inputs = "pitch,gate,velocity,mod", outputs = "out", first = 271, count = 11,
+             doc = "A DX7 operator: a sine at Ratio times the note with its own envelope; mod (another operator) bends its phase. Wire six as an algorithm for a DX7 voice."),
+    KindSpec(name = "Bus Comp", category = "Effects", inputs = "left,right,key", outputs = "left,right,reduction", first = 282, count = 13,
+             doc = "The mixing and mastering compressor: VCA (SSL bus glue, Auto release), FET (1176 bite), Opto (LA-2A, program-dependent), Vari-Mu (tube, ratio growing as it squeezes). Side HPF keeps the kick from pumping the mix; Mix for parallel."),
+    KindSpec(name = "Limiter", category = "Effects", inputs = "left,right", outputs = "left,right,reduction", first = 295, count = 7,
+             doc = "A mastering limiter: looks ahead so nothing passes the Ceiling, true peaks guessed between samples, Auto release against pumping, Soft Clip for density."),
+    KindSpec(name = "Scale Quantize", category = "Modulation", inputs = "pitch", outputs = "pitch", first = 302, count = 3,
+             doc = "Snaps a pitch to the nearest note of a scale, then steps Degrees along it. Scale Track follows the track's scale (the song's key changes); or pick a scale and root of its own."),
+]
+
+## How many comma-separated names `list` holds.
+pub func count_names(list: str) -> usize:
+    if list.length == 0:
+        return 0
+    var names: usize = 1
+    for byte in list.bytes:
+        if byte == ',': names += 1
+    return names
+
+## The `index`th comma-separated name of `list`, or "".
+pub func name_at(list: str, index: usize) -> str:
+    var at: usize = 0
+    var start: usize = 0
+    let bytes = list.bytes
+    for i in 0..<bytes.length:
+        if bytes[i] == ',':
+            if at == index:
+                return (str)bytes[start..<i]
+            at += 1
+            start = i + 1
+    if at == index:
+        return (str)bytes[start..]
+    return ""
+
+pub func input_count(kind: u32) -> usize:
+    return count_names(kinds[(usize)kind].inputs)
+
+pub func output_count(kind: u32) -> usize:
+    return count_names(kinds[(usize)kind].outputs)
+
+pub func param_count(kind: u32) -> usize:
+    return (usize)kinds[(usize)kind].count
+
+pub func param(kind: u32, index: usize) -> ParamSpec:
+    return params[(usize)kinds[(usize)kind].first + index]
+
+test "every kind's parameters are within the table and start inside their range":
+    for kind in 0..<(usize)count:
+        let spec = kinds[kind]
+        assert((usize)spec.first + (usize)spec.count <= params.length)
+        assert(count_names(spec.inputs) <= most_inputs and count_names(spec.outputs) <= most_outputs)
+        assert((usize)spec.count <= most_params)
+        for at in 0..<(usize)spec.count:
+            let p = params[(usize)spec.first + at]
+            assert(p.name.length > 0 and p.minimum <= p.initial and p.initial <= p.maximum)
+
+test "port names are read from their lists":
+    assert(count_names("pitch,gate,velocity,pan") == 4 and count_names("") == 0)
+    assert(name_at("pitch,gate,velocity", 1) == "gate" and name_at("in", 0) == "in" and name_at("in", 1) == "")
+
+## Whether a node of `kind` keeps sounding after its note ends (a drum, a
+## piano's tine, an echo or reverb): its voice then lives until it is silent.
+pub func rings(kind: u32) -> bool:
+    return kind == kick or kind == snare or kind == metal or kind == clap or kind == tine or kind == plate or kind == echo or kind == chorus or kind == delay or kind == reverb or kind == tape or kind == hall or kind == drum_machine or kind == freq_shifter
+
+## How long (s) a voice holding `kind` must be silent before it may end: an
+## echo's longest time, a plate's predelay, a drum's moment.
+pub func ring_hold(kind: u32) -> f32:
+    if kind == echo or kind == delay: return 2.3
+    if kind == plate or kind == reverb or kind == hall: return 0.6
+    if kind == tape: return 0.06
+    if kind == chorus: return 0.05
+    return 0.02
+
+test "every kind has a name of its own":
+    for a in 0..<(usize)count:
+        for b in a + 1..<(usize)count:
+            assert(kinds[a].name != kinds[b].name, "two kinds share a name")

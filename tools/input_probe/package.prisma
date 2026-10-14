@@ -1,0 +1,24 @@
+#prisma 4.0
+def package "input-probe" {
+    str owner = "dymokomi"
+    str version = "0.0.1"
+    str kind = "application"
+    str language = "luce-base"
+    str entry = "main.lucb"
+
+    def application "bundle" {
+        str name = "Input Probe"
+        str identifier = "com.luciaos.luce-audio.input-probe"
+        str microphone = "Input Probe measures your audio input for a few seconds."
+    }
+
+    def dependency "luce-audio" {
+        str owner = "dymokomi"
+        str path = "../.."
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../../../luce-std"
+    }
+}

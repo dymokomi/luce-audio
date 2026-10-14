@@ -1,0 +1,182 @@
+## What the analog models share: accurate cheap saturators (with their
+## antiderivatives for anti-aliasing), the 2x polyphase halfband filters a
+## nonlinear core runs between, slow drift, DC blocking, one-pole smoothing.
+## Sources: JUCE/sst FastMath (7/6 Padé tanh), VCV Fundamental VCF (halfband
+## coefficients, 78 dB), Parker et al. DAFx-16 (first-order ADAA), Surge's
+## DriftLFO. See reports/Analog synth component emulation.md.
+import dsp
+from dsp import absf, clampf
+
+# ---------------------------------------------------------------- saturators
+
+## tanh within 1e-6 on ±3 and 1e-4 on ±5 (JUCE/sst 7/6 Padé), clamped to
+## ±1 beyond ±5.
+pub inline func tanh(x: f32) -> f32:
+    if x > 5.0: return 1.0
+    if x < -5.0: return -1.0
+    let x2 = x * x
+    return x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2))) / (135135.0 + x2 * (62370.0 + x2 * (3150.0 + 28.0 * x2)))
+
+## tanh(x)/x, the gain a one-step linearized ZDF solver uses; 1 at 0.
+pub inline func tanh_gain(x: f32) -> f32:
+    if absf(x) < 0.0001: return 1.0
+    return tanh(x) / x
+
+## log(cosh(x)), tanh's antiderivative, for ADAA: exact enough and safe
+## for large |x| (|x| - log 2 asymptotically).
+pub inline func log_cosh(x: f32) -> f32:
+    let a = absf(x)
+    if a > 9.0: return a - 0.6931472
+    # log(cosh a) = a + log(1 + e^-2a) - log 2
+    let e = dsp.exp2(-2.8853900 * a)
+    return a - 0.6931472 + log1p(e)
+
+## log(1 + x) for x in [0, 1].
+inline func log1p(x: f32) -> f32:
+    # A 6th-order least-squares fit on [0, 1]; good to 3e-6.
+    return x * (0.99987661 + x * (-0.49760924 + x * (0.31669491 + x * (-0.19225480 + x * (0.08450444 + x * -0.01806778)))))
+
+## First-order antiderivative anti-aliasing of tanh (Parker, Zavalishin,
+## Le Bivic, DAFx-16): `previous` is the last input; 1/2 sample of delay.
+pub inline func tanh_adaa(x: f32, previous: f32) -> f32:
+    let d = x - previous
+    if absf(d) < 0.001:
+        return tanh(0.5 * (x + previous))
+    return (log_cosh(x) - log_cosh(previous)) / d
+
+## A hard clip to ±1 and its ADAA form.
+pub inline func hard_clip(x: f32) -> f32:
+    return clampf(x, -1.0, 1.0)
+
+inline func hard_clip_integral(x: f32) -> f32:
+    if x > 1.0: return x - 0.5
+    if x < -1.0: return -x - 0.5
+    return 0.5 * x * x
+
+pub inline func hard_clip_adaa(x: f32, previous: f32) -> f32:
+    let d = x - previous
+    if absf(d) < 0.001:
+        return hard_clip(0.5 * (x + previous))
+    return (hard_clip_integral(x) - hard_clip_integral(previous)) / d
+
+## A diode pair's asymmetric soft clip: the positive side rounds early, the
+## negative later (a hint of even harmonics), tanh-shaped.
+pub inline func diode_clip(x: f32, bias: f32) -> f32:
+    return tanh(x + bias) - tanh(bias)
+
+# ---------------------------------------------------------------- 2x oversampling
+
+## A polyphase IIR halfband (two 3-section allpass paths, VCV Fundamental's
+## coefficients): flat to 1e-7 dB below the base Nyquist, 78 dB down above.
+## Its memory is 12 floats (`band` of a State's `bands`).
+pub let band_size: usize = 12
+
+let path_coefficients: f32[6] = [0.062822416060049985, 0.22380733034648345, 0.4243808557204406, 0.61653443504951111, 0.7818614603969013, 0.92747359487482584]
+
+## The `index`th halfband memory of `bands`.
+pub inline func band(bands: f32[], index: usize) -> f32[]:
+    return bands[index * band_size..<(index + 1) * band_size]
+
+## Two samples at twice the rate from one: `first` then `second`.
+pub func upsample(h: f32[], input: f32) -> (f32, f32):
+    var even = input
+    var odd = input
+    var i: usize = 0
+    while i < 6:
+        let held_even = even
+        even = (even - h[6 + i]) * path_coefficients[i] + h[i]
+        h[i] = held_even
+        h[6 + i] = even
+        let held_odd = odd
+        odd = (odd - h[7 + i]) * path_coefficients[i + 1] + h[i + 1]
+        h[i + 1] = held_odd
+        h[7 + i] = odd
+        i += 2
+    return (even, odd)
+
+## One sample from two at twice the rate.
+pub func downsample(h: f32[], first: f32, second: f32) -> f32:
+    var path0 = second
+    var path1 = first
+    var i: usize = 0
+    while i < 6:
+        let held0 = path0
+        path0 = (path0 - h[6 + i]) * path_coefficients[i] + h[i]
+        h[i] = held0
+        h[6 + i] = path0
+        let held1 = path1
+        path1 = (path1 - h[7 + i]) * path_coefficients[i + 1] + h[i + 1]
+        h[i + 1] = held1
+        h[7 + i] = path1
+        i += 2
+    return 0.5 * (path0 + path1)
+
+# ---------------------------------------------------------------- drift and small filters
+
+## Slow analog drift: uniform noise through a very slow one-pole (Surge's
+## DriftLFO, α = 1e-5 at 48 kHz, rescaled by 1/√α), about ±1 wandering over
+## seconds. Advance once a block (`frames` samples).
+pub func drift(state: f32*, seed: u32*, frames: usize) -> f32:
+    let alpha = 0.00001 * (f32)frames
+    let noise = dsp.white(seed)
+    *state = *state + (noise * 316.22776 - *state) * clampf(alpha, 0.0, 1.0)
+    return clampf(*state * 0.0034, -1.0, 1.0)
+
+## A DC blocker: one zero at DC, a pole at `pole` (0.995 ≈ 40 Hz at 48 kHz).
+pub inline func dc_block(x: f32, last_in: f32*, last_out: f32*, pole: f32) -> f32:
+    let y = x - *last_in + pole * *last_out
+    *last_in = x
+    *last_out = y
+    return y
+
+## A one-pole lowpass coefficient for `hz` at `rate` (TPT, exact at cutoff).
+pub inline func one_pole(hz: f32, rate: f32) -> f32:
+    let g = dsp.tan_turns(clampf(hz / rate, 0.00001, 0.24) * 0.5)
+    return g / (1.0 + g)
+
+test "the 7/6 tanh is within 1e-5 of the library's":
+    for i in 0..<120:
+        let x = -6.0 + (f32)i * 0.1
+        let exact = (f32)library_tanh((f64)x)
+        assert(absf(tanh(x) - exact) < 0.00013, "tanh close")
+    assert(absf(tanh_gain(0.0) - 1.0) < 0.000001)
+
+test "tanh's ADAA matches tanh for slow inputs":
+    var previous: f32 = 0.0
+    for i in 1..<100:
+        let x = (f32)i * 0.03
+        let y = tanh_adaa(x, previous)
+        # a half-sample late: the tanh of the midpoint
+        assert(absf(y - tanh(x - 0.015)) < 0.001, "slow tanh ADAA")
+        previous = x
+
+test "the halfband passes a low tone and stops one above the base Nyquist":
+    var memory: f32[24]
+    let up = memory[0..<12]
+    let down = memory[12..<24]
+    # 1 kHz at 48 kHz up to 96 kHz and back: same level.
+    var peak: f32 = 0.0
+    for n in 0..<4800:
+        let x = dsp.sin_turns(phase_of((f64)n * 1000.0 / 48000.0))
+        let (a, b) = upsample(up, x)
+        let y = downsample(down, a, b)
+        if n > 2400 and absf(y) > peak: peak = absf(y)
+    assert(peak > 0.99 and peak < 1.01, "unity in the passband")
+    # 30 kHz at 96 kHz, decimated: at least 70 dB down.
+    var loud: f32 = 0.0
+    var fresh_memory: f32[12]
+    let fresh = fresh_memory[0..<12]
+    for n in 0..<4800:
+        let a = dsp.sin_turns(phase_of((f64)(2 * n) * 30000.0 / 96000.0))
+        let b = dsp.sin_turns(phase_of((f64)(2 * n + 1) * 30000.0 / 96000.0))
+        let y = downsample(fresh, a, b)
+        if n > 2400 and absf(y) > loud: loud = absf(y)
+    assert(loud < 0.0003, "above the base Nyquist is gone")
+
+## The fractional part of a phase in turns, kept in f64 until it is small.
+func phase_of(turns: f64) -> f32:
+    return (f32)(turns - (f64)(i64)turns)
+
+extern func tanh_c as "tanh"(x: f64) -> f64
+func library_tanh(x: f64) -> f64:
+    return tanh_c(x)

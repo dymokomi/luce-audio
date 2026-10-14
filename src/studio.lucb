@@ -1,0 +1,591 @@
+## Studio processing the synthwave and retro records lean on: a tape machine
+## (wow, flutter, head bump, saturation, hiss), a tempo-synced pump (the
+## French-touch sidechain), an eight-line hall that can be gated (the 80s
+## snare), and the JP-8000's supersaw. Sources: reports/Synthwave artist
+## production techniques.md. Nothing here allocates or traps.
+import dsp
+import analog
+import kinds
+import models
+import effects
+from dsp import State, Ports, clampf, absf, exp2, decibels
+from effects import tap_frac, put, allpass
+
+# ---------------------------------------------------------------- tape
+
+let most_tape: f32 = 0.05
+
+## A tape machine: the signal recorded through a saturating head (tanh with
+## a little bias for even harmonics, antiderivative anti-aliased), its
+## speed wandering (wow: a slow sine plus drift; flutter: a faster wobble),
+## the playback head's low bump, the high end rolling off, and hiss. Mode
+## sets the machine: Studio (a 15 ips deck: small wow, bump at 50 Hz),
+## Cassette (wobblier, bump at 90 Hz, darker), VHS (slow seasick warble,
+## bump at 110 Hz, darker still).
+## Inputs: left, right. Params: Mode, Drive (dB), Wow, Flutter, Bump (dB),
+## Tone (Hz), Hiss (dB), Mix.
+pub func tape(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let mode = (i32)p.params[0]
+    let drive = decibels(clampf(p.params[1], -12.0, 30.0))
+    let wow = clampf(p.params[2], 0.0, 1.0)
+    let flutter = clampf(p.params[3], 0.0, 1.0)
+    let bump_db = clampf(p.params[4], 0.0, 9.0)
+    var tone = clampf(p.params[5], 1000.0, 20000.0)
+    let hiss = decibels(clampf(p.params[6], -120.0, -20.0))
+    let wet = clampf(p.params[7], 0.0, 1.0)
+    let length = (usize)(most_tape * p.rate) + 4
+    let line = s.line
+    if line.length < 2 * length:
+        for i in 0..<p.frames:
+            left[i] = left_in[i]
+            right[i] = right_in[i]
+        return
+    # The machines: wow rate (Hz) and its pitch swing at Wow 1 (fraction),
+    # flutter rate and swing, the bump's frequency, a ceiling on Tone.
+    var wow_hz: f32 = 0.5
+    var wow_swing: f32 = 0.004
+    var flutter_hz: f32 = 7.0
+    var flutter_swing: f32 = 0.0015
+    var bump_hz: f32 = 50.0
+    if mode == 1:
+        wow_hz = 1.1
+        wow_swing = 0.008
+        flutter_hz = 11.0
+        flutter_swing = 0.003
+        bump_hz = 90.0
+        if tone > 11000.0: tone = 11000.0
+    elif mode == 2:
+        wow_hz = 0.3
+        wow_swing = 0.012
+        flutter_hz = 14.0
+        flutter_swing = 0.002
+        bump_hz = 110.0
+        if tone > 7500.0: tone = 7500.0
+    # A sine delay swing A at f swings pitch by 2πfA: A = swing / (2πf).
+    let wow_depth = wow * wow_swing / (6.2831855 * wow_hz) * p.rate
+    let flutter_depth = flutter * flutter_swing / (6.2831855 * flutter_hz) * p.rate
+    let center = 2.0 + wow_depth * 1.6 + flutter_depth
+    # The bump: an RBJ peak, Q 0.9.
+    let w = bump_hz / p.rate
+    let cos_w = dsp.sin_turns(w + 0.25)
+    let alpha = dsp.sin_turns(w) / 1.8
+    let big = exp2(bump_db * 0.0415241)
+    let a0 = 1.0 + alpha / big
+    let b0 = (1.0 + alpha * big) / a0
+    let b1 = -2.0 * cos_w / a0
+    let b2 = (1.0 - alpha * big) / a0
+    let a2 = (1.0 - alpha / big) / a0
+    let lp = analog.one_pole(tone, p.rate)
+    let bias: f32 = 0.15
+    let rest = analog.tanh(bias)
+    var wow_phase = (f32)s.a
+    var flutter_phase = (f32)s.b
+    var wander = (f32)s.c
+    var seed = s.seed
+    for i in 0..<p.frames:
+        wow_phase += wow_hz / p.rate
+        if wow_phase >= 1.0: wow_phase -= 1.0
+        flutter_phase += flutter_hz / p.rate
+        if flutter_phase >= 1.0: flutter_phase -= 1.0
+        wander = wander + (dsp.white(&seed) - wander) * (2.0 / p.rate)
+        let swing = wow_depth * (dsp.sin_turns(wow_phase) + 18.0 * wander) + flutter_depth * dsp.sin_turns(flutter_phase)
+        let delay = clampf(center + swing, 1.0, (f32)(length - 2))
+        for side: usize in 0..<2:
+            let x = left_in[i] if side == 0 else right_in[i]
+            # Record: through the head.
+            let u = x * drive + bias
+            let previous = s.damp[side]
+            s.damp[side] = u
+            let recorded = (analog.tanh_adaa(u, previous) - rest) / drive
+            put(line, side * length, length, &s.heads[side], recorded)
+            # Play back: the wandering speed, the bump, the roll-off, hiss.
+            var y = tap_frac(line, side * length, length, s.heads[side], delay)
+            let z = 2 + side * 2
+            let bumped = b0 * y + s.damp[z]
+            s.damp[z] = b1 * y - b1 * bumped + s.damp[z + 1]
+            s.damp[z + 1] = b2 * y - a2 * bumped
+            y = bumped + hiss * dsp.white(&seed)
+            let f = 6 + side * 2
+            s.damp[f] = s.damp[f] + (y - s.damp[f]) * lp
+            s.damp[f + 1] = s.damp[f + 1] + (s.damp[f] - s.damp[f + 1]) * lp
+            let out = x + (s.damp[f + 1] - x) * wet
+            if side == 0:
+                left[i] = out
+            else:
+                right[i] = out
+    s.a = (f64)wow_phase
+    s.b = (f64)flutter_phase
+    s.c = (f64)wander
+    s.seed = seed
+
+# ---------------------------------------------------------------- pump
+
+let pump_beats: f32[6] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+
+## The French-touch pump: the level ducks on every beat (or other step) of
+## the song and swells back, as a compressor keyed by the kick would (the
+## shape LFOTool and Kickstart draw). Depth is how far it ducks, Release the
+## part of the step it takes to come back, Curve how it comes back (1 a
+## line, higher sooner), Attack a few ms of fade into the duck so it does
+## not click. With the key input wired it follows that signal instead: its
+## level over Threshold ducks.
+## Inputs: left, right, key. Params: Rate, Depth, Release, Curve, Attack
+## (ms), Offset (of the step), Threshold (dB), Mix.
+pub func pump(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let keys = p.inputs[2]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let step = pump_beats[(usize)clampf(p.params[0], 0.0, 5.0)]
+    let depth = clampf(p.params[1], 0.0, 1.0)
+    let release = clampf(p.params[2], 0.02, 1.0)
+    let curve = clampf(p.params[3], 0.3, 6.0)
+    let attack_s = clampf(p.params[4], 0.0, 50.0) * 0.001
+    let offset = clampf(p.params[5], 0.0, 1.0)
+    let threshold = decibels(clampf(p.params[6], -60.0, 0.0))
+    let wet = clampf(p.params[7], 0.0, 1.0)
+    let seconds_per_beat = 1.0 / ((f32)p.beats_per_sample * p.rate) if p.beats_per_sample > 0.0 else 0.5
+    let attack = attack_s / (step * seconds_per_beat)
+    var level = (f32)s.a
+    let rise = analog.one_pole(1.0 / (attack_s + 0.0005), p.rate)
+    let fall = analog.one_pole(1.0 / (release * step * seconds_per_beat), p.rate)
+    for i in 0..<p.frames:
+        var gain: f32 = 1.0
+        if p.wired[2]:
+            let k = absf(keys[i])
+            level = level + (k - level) * (rise if k > level else fall)
+            gain = 1.0 - depth * clampf(level / threshold, 0.0, 1.0)
+        else:
+            let beat = (f32)(p.beat + p.beats_per_sample * (f64)i) / step - offset
+            let t = beat - dsp.floorf(beat)
+            # Into the duck over Attack, then back over Release.
+            var duck: f32 = 0.0
+            if t < attack:
+                duck = t / attack
+            else:
+                let back = clampf((t - attack) / release, 0.0, 1.0)
+                duck = 1.0 - pow_curve(back, curve)
+            gain = 1.0 - depth * duck
+        let g = 1.0 + (gain - 1.0) * wet
+        left[i] = left_in[i] * g
+        right[i] = right_in[i] * g
+    s.a = (f64)level
+
+## 1 - (1 - x)^curve as an exp2/log2 pair: how the pump comes back.
+inline func pow_curve(x: f32, curve: f32) -> f32:
+    let rest = 1.0 - x
+    if rest <= 0.0: return 1.0
+    return 1.0 - exp2(curve * log2(rest))
+
+pub inline func log2(x: f32) -> f32:
+    let bits = x.bits()
+    let exponent = (f32)(i32)((bits >> 23) & 255) - 127.0
+    let m = f32.bits((bits & 0x7fffff) | 0x3f800000)
+    return exponent + (-2.4967738 + (4.0283728 + (-2.0810602 + (0.62881573 - 0.079150366 * m) * m) * m) * m)
+
+# ---------------------------------------------------------------- hall
+
+## The hall's delays at Size 1 (ms): a predelay, four input diffusers, then
+## eight feedback lines (lengths spread, none a multiple of another).
+let hall_diffusers: f32[4] = [4.77, 3.59, 12.73, 9.30]
+let hall_lines: f32[8] = [43.1, 51.7, 59.3, 67.9, 76.1, 83.9, 92.3, 101.3]
+let most_hall_size: f32 = 2.5
+let most_hall_predelay: f32 = 0.3
+## Room for the lines' swing (ms).
+let hall_swing: f32 = 1.5
+
+## The shimmer's grain (s): its octave-up reader sweeps a window this long.
+let shimmer_window: f32 = 0.06
+
+## Where the hall's fourteen lines start and how long each is, at `rate`:
+## predelay, diffusers, the eight, the shimmer's.
+func hall_layout(rate: f32, lengths: usize[], bases: usize[]) -> usize:
+    let ms = rate * 0.001
+    lengths[0] = (usize)(most_hall_predelay * rate) + 4
+    for i in 0..<4: lengths[1 + i] = (usize)(hall_diffusers[i] * ms) + 1
+    for i in 0..<8: lengths[5 + i] = (usize)((hall_lines[i] * most_hall_size + hall_swing * 2.0) * ms) + 4
+    lengths[13] = (usize)(shimmer_window * rate) + 4
+    var at: usize = 0
+    for i in 0..<14:
+        bases[i] = at
+        at += lengths[i]
+    return at
+
+## A hall: input diffusion into an eight-line feedback delay network
+## (Hadamard mixing, Jot's per-line decay so every line falls 60 dB in
+## Decay seconds, a damping low pass in each line, slowly swung delays so
+## the tail shimmers and never rings). Gate shuts the tail that long after
+## the input falls quiet: the gated snare of the 80s (Gate 0 is off).
+## Shimmer feeds the tail back an octave up (two crossfaded grains reading
+## twice as fast), so it climbs and glows: the Mercury7 / Valhalla shimmer.
+## Inputs: left, right. Params: Decay (s), Size, Predelay (ms), Damping (Hz),
+## Mod Depth, Mod Rate (Hz), Low Cut (Hz), Width, Gate (s), Mix, Shimmer.
+pub func hall(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let decay = clampf(p.params[0], 0.1, 60.0)
+    let size = clampf(p.params[1], 0.2, most_hall_size)
+    let predelay = clampf(p.params[2], 0.0, most_hall_predelay * 1000.0 - 1.0) * p.rate * 0.001
+    let damping = analog.one_pole(clampf(p.params[3], 500.0, 20000.0), p.rate)
+    let mod_depth = clampf(p.params[4], 0.0, 1.0) * hall_swing * p.rate * 0.001
+    let mod_rate = clampf(p.params[5], 0.01, 5.0)
+    let low_cut = analog.one_pole(clampf(p.params[6], 10.0, 1000.0), p.rate)
+    let wide = clampf(p.params[7], 0.0, 2.0)
+    let gate_time = clampf(p.params[8], 0.0, 2.0)
+    let wet = clampf(p.params[9], 0.0, 1.0)
+    let shimmer = clampf(p.params[10], 0.0, 1.0)
+    var lengths: usize[14]
+    var bases: usize[14]
+    let total = hall_layout(p.rate, lengths, bases)
+    let window = shimmer_window * p.rate
+    let line = s.line
+    if line.length < total:
+        for i in 0..<p.frames:
+            left[i] = left_in[i]
+            right[i] = right_in[i]
+        return
+    let ms = p.rate * 0.001
+    var delays: f32[8]
+    var gains: f32[8]
+    for j in 0..<8:
+        delays[j] = hall_lines[j] * size * ms + hall_swing * ms
+        # Each pass through a line loses 60 dB × delay / Decay.
+        gains[j] = exp2(-9.965784 * delays[j] / (decay * p.rate))
+    var phase = (f32)s.a
+    var low = (f32)s.b
+    var follow = (f32)s.c
+    var open = (f32)s.d
+    var held = (f32)s.more[0]
+    var grain = (f32)s.more[1]
+    var climbed = (f32)s.more[2]
+    let follow_fall = dsp.fall(0.05, p.rate)
+    let open_rise = analog.one_pole(300.0, p.rate)
+    let open_fall = analog.one_pole(40.0, p.rate)
+    for i in 0..<p.frames:
+        let dry_l = left_in[i]
+        let dry_r = right_in[i]
+        var x = 0.5 * (dry_l + dry_r)
+        low = low + (x - low) * low_cut
+        x = x - low
+        put(line, bases[0], lengths[0], &s.heads[0], x)
+        x = effects.tap_frac(line, bases[0], lengths[0], s.heads[0], predelay + 1.0)
+        for d in 0..<4:
+            x = allpass(line, bases[1 + d], lengths[1 + d], &s.heads[1 + d], x, 0.7 if d < 2 else 0.6)
+        x = x + climbed * shimmer * 0.6
+        phase += mod_rate / p.rate
+        if phase >= 1.0: phase -= 1.0
+        var v: f32[8]
+        for j in 0..<8:
+            let swing = mod_depth * dsp.sin_turns(phase * (1.0 + 0.07 * (f32)j) + 0.125 * (f32)j)
+            let y = tap_frac(line, bases[5 + j], lengths[5 + j], s.heads[5 + j], clampf(delays[j] + swing, 1.0, (f32)(lengths[5 + j] - 2)))
+            s.damp[j] = s.damp[j] + (y - s.damp[j]) * damping
+            v[j] = s.damp[j]
+        var out_l = (v[0] - v[2] + v[4] - v[6]) * 0.5
+        var out_r = (v[1] - v[3] + v[5] - v[7]) * 0.5
+        if shimmer > 0.0:
+            # Octave up: two readers 180° apart whose delay shrinks a sample
+            # a sample (twice the speed), each faded in and out by a triangle.
+            put(line, bases[13], lengths[13], &s.heads[13], 0.5 * (out_l + out_r))
+            grain += 1.0 / window
+            if grain >= 1.0: grain -= 1.0
+            var other = grain + 0.5
+            if other >= 1.0: other -= 1.0
+            let one = tap_frac(line, bases[13], lengths[13], s.heads[13], 1.0 + (1.0 - grain) * window)
+            let two = tap_frac(line, bases[13], lengths[13], s.heads[13], 1.0 + (1.0 - other) * window)
+            climbed = one * (1.0 - absf(2.0 * grain - 1.0)) + two * (1.0 - absf(2.0 * other - 1.0))
+        # The fast Walsh-Hadamard transform, scaled to keep energy.
+        var h: usize = 1
+        while h < 8:
+            var a: usize = 0
+            while a < 8:
+                for b in a..<a + h:
+                    let u = v[b]
+                    let w = v[b + h]
+                    v[b] = u + w
+                    v[b + h] = u - w
+                a += h * 2
+            h *= 2
+        for j in 0..<8:
+            let sign: f32 = 1.0 if (j & 1) == 0 else -1.0
+            put(line, bases[5 + j], lengths[5 + j], &s.heads[5 + j], x * sign * 0.5 + v[j] * 0.35355339 * gains[j])
+        if gate_time > 0.0:
+            let level = absf(dry_l) + absf(dry_r)
+            follow = level if level > follow else follow * follow_fall
+            if follow > 0.003: held = gate_time
+            else: held -= 1.0 / p.rate
+            let want: f32 = 1.0 if held > 0.0 else 0.0
+            open = open + (want - open) * (open_rise if want > open else open_fall)
+            out_l *= open
+            out_r *= open
+        let mid = 0.5 * (out_l + out_r)
+        let side = 0.5 * (out_l - out_r) * wide
+        left[i] = dry_l + (mid + side - dry_l) * wet
+        right[i] = dry_r + (mid - side - dry_r) * wet
+    s.a = (f64)phase
+    s.b = (f64)low
+    s.c = (f64)follow
+    s.d = (f64)open
+    s.more[0] = (f64)held
+    s.more[1] = (f64)grain
+    s.more[2] = (f64)climbed
+
+# ---------------------------------------------------------------- supersaw
+
+## The JP-8000's seven saws (Adam Szabo, "How to Emulate the Super Saw",
+## 2010): their measured detune ratios, the knob's measured curve, the
+## centre saw's and side saws' levels as Mix moves, free-running phases, and
+## a high pass at the fundamental that clears the mud below it.
+let saw_offsets: f32[7] = [-0.11002313, -0.06288439, -0.01952356, 0.0, 0.01991221, 0.06216538, 0.10745242]
+## Where each saw sits, -1 left to 1 right, at full Spread.
+let saw_places: f32[7] = [-1.0, 0.66, -0.33, 0.0, 0.33, -0.66, 1.0]
+
+inline func detune_curve(x: f32) -> f32:
+    return ((((((((((10028.7312891634 * x - 50818.8652045924) * x + 111363.4808729368) * x - 138150.6761080548) * x + 106649.6679158292) * x - 53046.9642751875) * x + 17019.9518580080) * x - 3425.0836591318) * x + 404.2703938388) * x - 24.1878824391) * x + 0.6717417634) * x + 0.0030115596
+
+## The supersaw: seven detuned saws, spread across the stereo field.
+## Inputs: pitch (octaves), fm (octaves, added), detune (added).
+## Params: Octave, Semitones, Fine, Detune, Mix, Spread, Level, Drift.
+pub func supersaw(s: State*, p: Ports*):
+    let pitch = p.inputs[0]
+    let fm = p.inputs[1]
+    let detunes = p.inputs[2]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let mix = clampf(p.params[4], 0.0, 1.0)
+    let spread = clampf(p.params[5], 0.0, 1.0)
+    let level = p.params[6]
+    var wander = (f32)s.d
+    let walk = analog.drift(&wander, &s.seed, p.frames)
+    s.d = (f64)wander
+    let drift = (walk * p.params[7] + s.variation * p.params[7] * 0.4) / 1200.0
+    let tune = p.params[0] + p.params[1] / 12.0 + p.params[2] / 1200.0 + drift
+    let base = 261.62558 / p.rate
+    let center = -0.55366 * mix + 0.99785
+    let sides = -0.73764 * mix * mix + 1.2841 * mix + 0.044372
+    # Equal-power places for each saw.
+    var to_left: f32[7]
+    var to_right: f32[7]
+    for k in 0..<7:
+        let place = saw_places[k] * spread
+        let gain = center if k == 3 else sides
+        to_left[k] = gain * (0.5 - 0.5 * place) * 0.6
+        to_right[k] = gain * (0.5 + 0.5 * place) * 0.6
+    # First time: free-running phases start anywhere.
+    if s.stage == 0:
+        for k in 0..<7: s.more[k] = (f64)(0.5 + 0.5 * dsp.white(&s.seed))
+        s.stage = 1
+    var phases: f32[7]
+    for k in 0..<7: phases[k] = (f32)s.more[k]
+    var hp_l = s.damp[0]
+    var hp_r = s.damp[1]
+    for i in 0..<p.frames:
+        var octaves = tune
+        if p.wired[0]: octaves += pitch[i]
+        if p.wired[1]: octaves += fm[i]
+        let f0 = base * exp2(octaves)
+        var amount = p.params[3]
+        if p.wired[2]: amount = amount + detunes[i]
+        let spread_ratio = detune_curve(clampf(amount, 0.0, 1.0))
+        var l: f32 = 0.0
+        var r: f32 = 0.0
+        for k in 0..<7:
+            let dt = clampf(f0 * (1.0 + saw_offsets[k] * spread_ratio), 0.000001, 0.45)
+            var t = phases[k] + dt
+            if t >= 1.0: t -= 1.0
+            phases[k] = t
+            let saw = 2.0 * t - 1.0 - models.blep(t, dt)
+            l += saw * to_left[k]
+            r += saw * to_right[k]
+        # The high pass at the fundamental.
+        let g = analog.one_pole(f0 * p.rate, p.rate)
+        hp_l = hp_l + (l - hp_l) * g
+        hp_r = hp_r + (r - hp_r) * g
+        left[i] = (l - hp_l) * level
+        right[i] = (r - hp_r) * level
+    for k in 0..<7: s.more[k] = (f64)phases[k]
+    s.damp[0] = hp_l
+    s.damp[1] = hp_r
+
+# ---------------------------------------------------------------- memory
+
+## The line memory (samples) a voice of `kind` needs at `rate`, or 0.
+pub func memory_of(kind: u32, rate: f64) -> usize:
+    if kind == kinds.tape:
+        return 2 * ((usize)(most_tape * (f32)rate) + 4)
+    if kind == kinds.eq:
+        return 64
+    if kind == kinds.limiter:
+        return 3 * ((usize)(0.005 * (f32)rate) + 8)
+    if kind == kinds.freq_shifter:
+        return 66
+    if kind == kinds.width:
+        return (usize)(most_haas * (f32)rate) + 4
+    if kind == kinds.hall:
+        var lengths: usize[14]
+        var bases: usize[14]
+        return hall_layout((f32)rate, lengths, bases)
+    return 0
+
+# ---------------------------------------------------------------- tempo LFO
+
+let lfo_beats: f32[10] = [0.125, 0.1666667, 0.25, 0.3333333, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+
+## An LFO locked to the song: one cycle every Rate (1/32 to 4 bars, with
+## triplets), started at Phase; as the transport moves it follows the beat,
+## so filter sweeps and wobbles land on the bar. Waves: sine, triangle, ramp
+## up, ramp down, square, sample-and-hold, smooth random (Elektron's).
+## Bipolar -1..1 times Depth, or 0..1 with Unipolar.
+## Inputs: none. Params: Wave, Rate, Phase, Depth, Unipolar.
+pub func tempo_lfo(s: State*, p: Ports*):
+    let out = p.outputs[0]
+    let wave = (i32)p.params[0]
+    let cycle = lfo_beats[(usize)clampf(p.params[1], 0.0, 9.0)]
+    let start = p.params[2]
+    let depth = p.params[3]
+    let unipolar = p.params[4] > 0.5
+    var held = (f32)s.a
+    var next = (f32)s.b
+    var last_cycle = s.c
+    var seed = s.seed
+    for i in 0..<p.frames:
+        let position = (p.beat + p.beats_per_sample * (f64)i) / (f64)cycle + (f64)start
+        let whole = (f64)(i64)position
+        let t = (f32)(position - whole)
+        if whole != last_cycle:
+            last_cycle = whole
+            held = next
+            next = dsp.white(&seed)
+        var value: f32 = 0.0
+        if wave == 0: value = dsp.sin_turns(t)
+        elif wave == 1: value = 1.0 - 4.0 * absf(t - 0.5)
+        elif wave == 2: value = 2.0 * t - 1.0
+        elif wave == 3: value = 1.0 - 2.0 * t
+        elif wave == 4: value = 1.0 if t < 0.5 else -1.0
+        elif wave == 5: value = held
+        else:
+            # Smooth random: a cosine glide from the last value to the next.
+            let blend = 0.5 - 0.5 * dsp.sin_turns(t * 0.5 + 0.25)
+            value = held + (next - held) * blend
+        if unipolar: value = 0.5 + 0.5 * value
+        out[i] = value * depth
+    s.a = (f64)held
+    s.b = (f64)next
+    s.c = last_cycle
+    s.seed = seed
+
+# ---------------------------------------------------------------- width
+
+## Stereo width: mid/side (0 mono, 1 as is, 2 twice as wide), the side's
+## lows folded to mono below Mono Bass so the low end stays centred, and a
+## Haas delay (up to 30 ms) on the right that widens even a mono part.
+## Inputs: left, right. Params: Width, Mono Bass (Hz), Haas (ms), Balance.
+let most_haas: f32 = 0.032
+
+pub func width(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let amount = clampf(p.params[0], 0.0, 3.0)
+    let low = analog.one_pole(clampf(p.params[1], 10.0, 500.0), p.rate)
+    let haas = clampf(p.params[2], 0.0, 30.0) * p.rate * 0.001
+    let balance = clampf(p.params[3], -1.0, 1.0)
+    let length = (usize)(most_haas * p.rate) + 4
+    let line = s.line
+    var side_low = s.damp[0]
+    for i in 0..<p.frames:
+        var r = right_in[i]
+        if haas >= 1.0 and line.length >= length:
+            put(line, 0, length, &s.heads[0], r)
+            r = tap_frac(line, 0, length, s.heads[0], haas)
+        let mid = 0.5 * (left_in[i] + r)
+        var side = 0.5 * (left_in[i] - r)
+        side_low = side_low + (side - side_low) * low
+        side = (side - side_low) * amount
+        left[i] = (mid + side) * (1.0 - balance if balance > 0.0 else 1.0)
+        right[i] = (mid - side) * (1.0 + balance if balance < 0.0 else 1.0)
+    s.damp[0] = side_low
+
+# ---------------------------------------------------------------- frequency shifter
+
+## Two allpass chains whose outputs stay 90° apart from 20 Hz to 20 kHz at
+## 44.1-48 kHz (Olli Niemitalo's coefficients, squared here): a Hilbert pair.
+let hilbert_a: f32[4] = [0.47940087, 0.87621849, 0.97659759, 0.99749926]
+let hilbert_b: f32[4] = [0.1617585, 0.73302893, 0.9453497, 0.99059916]
+
+## One side's Hilbert pair: the in-phase and quadrature parts of `x`. Its
+## memory is 32 floats at `m`.
+inline func hilbert(m: f32[], base: usize, x: f32) -> (f32, f32):
+    var a = x
+    var b = x
+    for k: usize in 0..<4:
+        let i = base + k * 4
+        # y = c (x + y[n-2]) - x[n-2]
+        let ya = hilbert_a[k] * (a + m[i + 3]) - m[i + 1]
+        m[i + 1] = m[i]
+        m[i] = a
+        m[i + 3] = m[i + 2]
+        m[i + 2] = ya
+        a = ya
+        let j = base + 16 + k * 4
+        let yb = hilbert_b[k] * (b + m[j + 3]) - m[j + 1]
+        m[j + 1] = m[j]
+        m[j] = b
+        m[j + 3] = m[j + 2]
+        m[j + 2] = yb
+        b = yb
+    # The first path is a sample late by design.
+    let late = m[base + 32]
+    m[base + 32] = a
+    return (late, b)
+
+## A frequency shifter (the Bode / Eventide kind Com Truise runs drums
+## through): every partial moves by Shift Hz, so harmonics stop being
+## harmonic; a few Hz is a slow phasing swirl, tens of Hz a metallic detune.
+## Spread shifts the right side the other way. Feedback re-shifts the
+## output (the barber-pole climb).
+## Inputs: left, right, shift (Hz, added). Params: Shift (Hz), Feedback,
+## Spread, Mix.
+pub func freq_shifter(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let shifts = p.inputs[2]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let feedback = clampf(p.params[1], 0.0, 0.95)
+    let spread = p.params[2] > 0.5
+    let wet = clampf(p.params[3], 0.0, 1.0)
+    let m = s.line
+    if m.length < 66:
+        for i in 0..<p.frames:
+            left[i] = left_in[i]
+            right[i] = right_in[i]
+        return
+    var phase = (f32)s.a
+    var fb_l = (f32)s.b
+    var fb_r = (f32)s.c
+    for i in 0..<p.frames:
+        var shift = p.params[0]
+        if p.wired[2]: shift = shift + shifts[i]
+        phase += shift / p.rate
+        phase -= dsp.floorf(phase)
+        let c = dsp.sin_turns(phase + 0.25)
+        let sn = dsp.sin_turns(phase)
+        let (il, ql) = hilbert(m, 0, left_in[i] + fb_l * feedback)
+        let (ir, qr) = hilbert(m, 33, right_in[i] + fb_r * feedback)
+        let yl = il * c + ql * sn
+        let yr = ir * c - qr * sn if spread else ir * c + qr * sn
+        fb_l = yl
+        fb_r = yr
+        left[i] = left_in[i] + (yl - left_in[i]) * wet
+        right[i] = right_in[i] + (yr - right_in[i]) * wet
+    s.a = (f64)phase
+    s.b = (f64)fb_l
+    s.c = (f64)fb_r

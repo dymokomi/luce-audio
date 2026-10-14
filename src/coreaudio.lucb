@@ -1,0 +1,128 @@
+## CoreAudio and AudioToolbox, as much as a duplex HAL output unit needs: the
+## component and unit calls, the property records, and the four-character
+## codes. The render callback C calls is a plain Base function (§5.6).
+import c
+
+pub extern struct ComponentDescription:
+    pub kind: u32
+    pub sub_kind: u32
+    pub manufacturer: u32
+    pub flags: u32
+    pub flags_mask: u32
+
+pub extern struct StreamDescription:
+    pub sample_rate: f64
+    pub format: u32
+    pub format_flags: u32
+    pub bytes_per_packet: u32
+    pub frames_per_packet: u32
+    pub bytes_per_frame: u32
+    pub channels_per_frame: u32
+    pub bits_per_channel: u32
+    pub reserved: u32
+
+pub extern struct PropertyAddress:
+    pub selector: u32
+    pub scope: u32
+    pub element: u32
+
+pub extern struct ValueRange:
+    pub minimum: f64
+    pub maximum: f64
+
+pub extern struct Buffer:
+    pub channels: u32
+    pub size: u32
+    pub data: void*?
+
+## AudioBufferList's fixed part; its buffers follow at offset 8.
+pub extern struct BufferList:
+    pub count: u32
+    pub pad: u32
+
+pub extern struct SmpteTime:
+    pub subframes: i16
+    pub subframe_divisor: i16
+    pub counter: u32
+    pub kind: u32
+    pub flags: u32
+    pub hours: i16
+    pub minutes: i16
+    pub seconds: i16
+    pub frames: i16
+
+pub extern struct TimeStamp:
+    pub sample_time: f64
+    pub host_time: u64
+    pub rate_scalar: f64
+    pub word_clock_time: u64
+    pub smpte: SmpteTime
+    pub flags: u32
+    pub reserved: u32
+
+## An AudioBufferList with room for eight buffers, kept where its owner
+## lives so nothing is allocated to pull input.
+pub extern struct InputList:
+    pub count: u32
+    pub pad: u32
+    pub buffers: Buffer[8]
+
+pub type RenderProc = func(void*?, u32*, const TimeStamp*, u32, u32, BufferList*?) -> i32
+
+pub extern struct RenderCallback:
+    pub proc: RenderProc
+    pub context: void*?
+
+pub let type_output: u32 = 0x61756F75          # 'auou'
+pub let sub_hal_output: u32 = 0x6168616C       # 'ahal'
+pub let manufacturer_apple: u32 = 0x6170706C   # 'appl'
+pub let format_linear_pcm: u32 = 0x6C70636D    # 'lpcm'
+pub let flag_float: u32 = 1
+pub let flag_packed: u32 = 8
+pub let flag_non_interleaved: u32 = 32
+
+pub let property_stream_format: u32 = 8
+pub let property_maximum_frames: u32 = 14
+pub let property_render_callback: u32 = 23
+pub let property_current_device: u32 = 2000
+pub let property_channel_map: u32 = 2002
+pub let property_enable_io: u32 = 2003
+pub let scope_global: u32 = 0
+pub let scope_input: u32 = 1
+pub let scope_output: u32 = 2
+
+pub let system_object: u32 = 1
+pub let default_output_device: u32 = 0x644F7574   # 'dOut'
+pub let object_scope_global: u32 = 0x676C6F62     # 'glob'
+pub let object_scope_output: u32 = 0x6F757470     # 'outp'
+pub let object_scope_input: u32 = 0x696E7074      # 'inpt'
+pub let default_input_device: u32 = 0x64496E20    # 'dIn '
+pub let hardware_devices: u32 = 0x64657623        # 'dev#'
+pub let stream_configuration: u32 = 0x736C6179    # 'slay'
+pub let nominal_sample_rate: u32 = 0x6E737274     # 'nsrt'
+pub let buffer_frame_size: u32 = 0x6673697A       # 'fsiz'
+pub let buffer_frame_size_range: u32 = 0x66737A23 # 'fsz#'
+pub let device_latency: u32 = 0x6C746E63          # 'ltnc'
+pub let safety_offset: u32 = 0x73616674           # 'saft'
+pub let stream_list: u32 = 0x73746D23             # 'stm#'
+pub let device_name: u32 = 0x6E616D65             # 'name'
+
+pub extern func AudioComponentFindNext(component: void*?, description: const ComponentDescription*) -> void*?
+pub extern func AudioComponentInstanceNew(component: void*, out instance: void*?) -> i32
+pub extern func AudioComponentInstanceDispose(instance: void*) -> i32
+pub extern func AudioUnitSetProperty(unit: void*, property: u32, scope: u32, element: u32, data: const void*, size: u32) -> i32
+pub extern func AudioUnitGetProperty(unit: void*, property: u32, scope: u32, element: u32, data: void*, size: u32*) -> i32
+pub extern func AudioUnitInitialize(unit: void*) -> i32
+pub extern func AudioUnitUninitialize(unit: void*) -> i32
+pub extern func AudioUnitRender(unit: void*, flags: u32*, stamp: const TimeStamp*, bus: u32, frames: u32, data: BufferList*) -> i32
+pub extern func AudioOutputUnitStart(unit: void*) -> i32
+pub extern func AudioOutputUnitStop(unit: void*) -> i32
+pub extern func AudioObjectGetPropertyData(object: u32, address: const PropertyAddress*, qualifier_size: u32, qualifier: const void*?, size: u32*, data: void*) -> i32
+pub extern func AudioObjectSetPropertyData(object: u32, address: const PropertyAddress*, qualifier_size: u32, qualifier: const void*?, size: u32, data: const void*) -> i32
+pub extern func AudioObjectGetPropertyDataSize(object: u32, address: const PropertyAddress*, qualifier_size: u32, qualifier: const void*?, size: u32*) -> i32
+pub extern func AudioConvertHostTimeToNanos(host_time: u64) -> u64
+pub extern func AudioGetCurrentHostTime() -> u64
+
+## The `index`th buffer of `list`.
+pub func buffer_at(list: BufferList*, index: u32) -> Buffer*:
+    return (Buffer*)((u8*)list + 8 + (usize)index * 16)

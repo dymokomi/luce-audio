@@ -1,0 +1,181 @@
+## Musical scales: a root and the pitch classes above it a scale allows, and
+## the notes a scale gives a pitch. The song keeps a timeline of scale keys
+## (a key change is a key at its beat); a track follows the song's, keeps its
+## own, or plays as written. Notes are moved when they start, so written
+## clips never change. Nothing here allocates or traps.
+import dsp
+from dsp import State, Ports
+
+## A scale: `root` 0..11 (C..B) and `mask`, bit k set when the pitch class k
+## semitones above the root belongs. Mask 0 or all twelve: every note.
+pub struct Scale:
+    pub var root: i32
+    pub var mask: u32
+
+## A scale from `beat` on, until the next key.
+pub struct Key:
+    pub var beat: f64
+    pub var scale: Scale
+
+pub let every_note: u32 = 0xFFF
+
+## The modes on offer, as their masks and names (one per `mode_names` item).
+pub let modes: u32[19] = [
+    0xFFF,                                    # Chromatic
+    0xAB5,                                    # Major: 0 2 4 5 7 9 11
+    0x5AD,                                    # Minor: 0 2 3 5 7 8 10
+    0x6AD,                                    # Dorian: 0 2 3 5 7 9 10
+    0x5AB,                                    # Phrygian: 0 1 3 5 7 8 10
+    0xAD5,                                    # Lydian: 0 2 4 6 7 9 11
+    0x6B5,                                    # Mixolydian: 0 2 4 5 7 9 10
+    0x56B,                                    # Locrian: 0 1 3 5 6 8 10
+    0x9AD,                                    # Harmonic Minor: 0 2 3 5 7 8 11
+    0xAAD,                                    # Melodic Minor: 0 2 3 5 7 9 11
+    0x295,                                    # Major Pentatonic: 0 2 4 7 9
+    0x4A9,                                    # Minor Pentatonic: 0 3 5 7 10
+    0x4E9,                                    # Blues: 0 3 5 6 7 10
+    0x555,                                    # Whole Tone: 0 2 4 6 8 10
+    0x6DB,                                    # Diminished: 0 1 3 4 6 7 9 10
+    0x5B3,                                    # Phrygian Dominant: 0 1 4 5 7 8 10
+    0x9CD,                                    # Hungarian Minor: 0 2 3 6 7 8 11
+    0x18D,                                    # Hirajoshi: 0 2 3 7 8
+    0x4A3,                                    # In Sen: 0 1 5 7 10
+]
+
+pub let mode_names: str = "Chromatic|Major|Minor|Dorian|Phrygian|Lydian|Mixolydian|Locrian|Harmonic Minor|Melodic Minor|Major Pentatonic|Minor Pentatonic|Blues|Whole Tone|Diminished|Phrygian Dominant|Hungarian Minor|Hirajoshi|In Sen"
+
+pub let root_names: str = "C|C♯|D|E♭|E|F|F♯|G|A♭|A|B♭|B"
+
+## Mode `index`'s mask; chromatic when out of range.
+pub func mode_mask(index: i64) -> u32:
+    if index < 0 or index >= (i64)modes.length: return every_note
+    return modes[(usize)index]
+
+## Whether `scale` lets every note through.
+pub inline func chromatic(scale: Scale) -> bool:
+    let mask = scale.mask & every_note
+    return mask == 0 or mask == every_note
+
+## Whether MIDI note `note` belongs to `scale`.
+pub inline func contains(scale: Scale, note: i32) -> bool:
+    if chromatic(scale): return true
+    var degree = (note - scale.root) % 12
+    if degree < 0: degree += 12
+    return (scale.mask >> (u32)degree) & 1 == 1
+
+## The note of `scale` nearest `note`; a tie goes down.
+pub func quantize(note: i32, scale: Scale) -> i32:
+    if chromatic(scale): return note
+    for distance in 0..<7:
+        let below = note - (i32)distance
+        if below >= 0 and contains(scale, below): return below
+        let above = note + (i32)distance
+        if above <= 127 and contains(scale, above): return above
+    return note
+
+## The note `steps` scale degrees from `note` (itself first quantized).
+pub func step(note: i32, steps: i32, scale: Scale) -> i32:
+    var at = quantize(note, scale)
+    if chromatic(scale): return at + steps
+    var left = steps
+    while left > 0 and at < 127:
+        at += 1
+        if contains(scale, at): left -= 1
+    while left < 0 and at > 0:
+        at -= 1
+        if contains(scale, at): left += 1
+    return at
+
+## A continuous pitch, in semitones, moved to the nearest note of `scale`.
+pub func quantize_semitones(semitones: f32, scale: Scale) -> f32:
+    var base = (i32)semitones
+    if (f32)base > semitones: base -= 1
+    var best = base
+    var nearest: f32 = 1000.0
+    for offset in -6..<8:
+        let candidate = base + (i32)offset
+        if not contains(scale, candidate + 60): continue
+        var distance = semitones - (f32)candidate
+        if distance < 0.0: distance = -distance
+        if distance < nearest:
+            nearest = distance
+            best = candidate
+    return (f32)best
+
+## The scale in force at `beat` among `keys` (sorted by beat): the last key
+## at or before it, or before the first key the first; `fallback` with none.
+pub func key_at(keys: const Key[], beat: f64, fallback: Scale) -> Scale:
+    if keys.length == 0: return fallback
+    var low: usize = 0
+    var high = keys.length
+    while low < high:
+        let middle = low + (high - low) // 2
+        if keys[middle].beat <= beat:
+            low = middle + 1
+        else:
+            high = middle
+    if low == 0: return keys[0].scale
+    return keys[low - 1].scale
+
+## Scale Quantize: a pitch (octaves) moved to the nearest note of a scale,
+## then Degrees steps along it. Scale "Track" follows the track's scale (the
+## song's keys); the others use their own with Root.
+## Params: Scale (0 Track, then the modes), Root, Degrees.
+pub func quantizer(s: State*, p: Ports*):
+    let pitch = p.inputs[0]
+    let out = p.outputs[0]
+    let choice = (i64)p.params[0]
+    var chosen = Scale(root = p.scale_root, mask = p.scale_mask)
+    if choice > 0:
+        chosen = Scale(root = (i32)p.params[1], mask = mode_mask(choice - 1))
+    let degrees = (i32)p.params[2]
+    # Most blocks hold one pitch: answer it once.
+    var last_in = (f32)s.a
+    var last_out = (f32)s.b
+    let fresh = s.c == 0.0 or (f64)chosen.root != s.d or (f64)chosen.mask != s.more[0] or (f64)degrees != s.more[1]
+    for i in 0..<p.frames:
+        let x = pitch[i] if p.wired[0] else 0.0
+        if fresh or x != last_in:
+            let semitones = quantize_semitones(x * 12.0, chosen)
+            let moved = step((i32)semitones + 60, degrees, chosen) - 60 if degrees != 0 else (i32)semitones
+            last_in = x
+            last_out = (f32)moved / 12.0
+        out[i] = last_out
+    s.a = (f64)last_in
+    s.b = (f64)last_out
+    s.c = 1.0
+    s.d = (f64)chosen.root
+    s.more[0] = (f64)chosen.mask
+    s.more[1] = (f64)degrees
+
+test "notes move to the nearest note of the scale, ties down":
+    let c_major = Scale(root = 0, mask = mode_mask(1))
+    assert(quantize(60, c_major) == 60 and quantize(61, c_major) == 60 and quantize(63, c_major) == 62 and quantize(66, c_major) == 65)
+    let a_minor_pentatonic = Scale(root = 9, mask = mode_mask(11))
+    # A C D E G: F (65) is a tone from E and G; it goes down to E.
+    assert(quantize(65, a_minor_pentatonic) == 64 and quantize(66, a_minor_pentatonic) == 67 and quantize(69, a_minor_pentatonic) == 69)
+    assert(quantize(61, Scale(root = 0, mask = every_note)) == 61 and quantize(61, Scale(root = 0, mask = 0)) == 61)
+
+test "every mode has its root and as many notes as it should":
+    let sizes: i32[19] = [12, 7, 7, 7, 7, 7, 7, 7, 7, 7, 5, 5, 6, 6, 8, 7, 7, 5, 5]
+    for m in 0..<modes.length:
+        assert(modes[m] & 1 == 1, "a mode without its root")
+        var notes: i32 = 0
+        for k in 0..<12:
+            if (modes[m] >> (u32)k) & 1 == 1: notes += 1
+        assert(notes == sizes[m])
+
+test "degrees step through the scale":
+    let d_dorian = Scale(root = 2, mask = mode_mask(3))
+    assert(step(62, 1, d_dorian) == 64 and step(62, 2, d_dorian) == 65 and step(62, 7, d_dorian) == 74 and step(62, -1, d_dorian) == 60)
+
+test "the key in force is the last one at or before the beat":
+    let c = Scale(root = 0, mask = mode_mask(1))
+    let e_flat = Scale(root = 3, mask = mode_mask(1))
+    let keys: Key[2] = [Key(beat = 0.0, scale = c), Key(beat = 16.0, scale = e_flat)]
+    let none_set = Scale(root = 0, mask = every_note)
+    assert(key_at(keys, 3.0, none_set).root == 0 and key_at(keys, 16.0, none_set).root == 3 and key_at(keys, 99.0, none_set).root == 3 and key_at(keys, -1.0, none_set).root == 0)
+
+test "a continuous pitch lands on a scale note":
+    let c_major = Scale(root = 0, mask = mode_mask(1))
+    assert(quantize_semitones(0.4, c_major) == 0.0 and quantize_semitones(1.2, c_major) == 2.0 and quantize_semitones(-0.6, c_major) == -1.0 and quantize_semitones(5.6, c_major) == 5.0)

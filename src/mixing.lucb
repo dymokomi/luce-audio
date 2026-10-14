@@ -1,0 +1,503 @@
+## Mixing tools: the channel EQ that carves room for each part (cut the
+## lows of everything but the bass, dip the mud, lift the presence).
+## Filters after Andrew Simper's (Cytomic) trapezoidal state-variable
+## designs, which stay clean while their knobs move. Nothing here allocates
+## or traps.
+import dsp
+import analog
+from dsp import State, Ports, clampf, absf, decibels, exp2
+from effects import put, tap
+
+## One band's coefficients: the SVF's a1..a3 and how it mixes its input,
+## band pass and low pass (m0 v0 + m1 v1 + m2 v2).
+struct Band:
+    var a1: f32
+    var a2: f32
+    var a3: f32
+    var m0: f32
+    var m1: f32
+    var m2: f32
+    var on: bool
+
+func make_band(g: f32, k: f32, m0: f32, m1: f32, m2: f32) -> Band:
+    let a1 = 1.0 / (1.0 + g * (g + k))
+    let a2 = g * a1
+    return Band(a1 = a1, a2 = a2, a3 = g * a2, m0 = m0, m1 = m1, m2 = m2, on = true)
+
+inline func warp(hz: f32, rate: f32) -> f32:
+    return dsp.tan_turns(clampf(hz / rate, 0.00001, 0.48) * 0.5)
+
+func low_cut(hz: f32, rate: f32) -> Band:
+    return make_band(warp(hz, rate), 1.4142135, 1.0, -1.4142135, -1.0)
+
+func high_cut(hz: f32, rate: f32) -> Band:
+    return make_band(warp(hz, rate), 1.4142135, 0.0, 0.0, 1.0)
+
+func bell(hz: f32, db: f32, q: f32, rate: f32) -> Band:
+    let a = decibels(db * 0.5)
+    let k = 1.0 / (q * a)
+    return make_band(warp(hz, rate), k, 1.0, k * (a * a - 1.0), 0.0)
+
+func low_shelf(hz: f32, db: f32, rate: f32) -> Band:
+    let a = decibels(db * 0.5)
+    let k: f32 = 1.4142135
+    return make_band(warp(hz, rate) / decibels(db * 0.25), k, 1.0, k * (a - 1.0), a * a - 1.0)
+
+func high_shelf(hz: f32, db: f32, rate: f32) -> Band:
+    let a = decibels(db * 0.5)
+    let k: f32 = 1.4142135
+    return make_band(warp(hz, rate) * decibels(db * 0.25), k, a * a, k * (1.0 - a) * a, 1.0 - a * a)
+
+## Run `band` on `x` with its two integrators at m[at], m[at + 1].
+inline func run(b: const Band*, m: f32[], at: usize, x: f32) -> f32:
+    let ic1 = m[at]
+    let ic2 = m[at + 1]
+    let v3 = x - ic2
+    let v1 = b.a1 * ic1 + b.a2 * v3
+    let v2 = ic2 + b.a2 * ic1 + b.a3 * v3
+    m[at] = 2.0 * v1 - ic1
+    m[at + 1] = 2.0 * v2 - ic2
+    return b.m0 * x + b.m1 * v1 + b.m2 * v2
+
+## A channel EQ: low cut and high cut (12 or 24 dB an octave), low and high
+## shelves, two bells. A band at 0 dB, or a cut at its end, costs nothing.
+## Inputs: left, right.
+## Params: Low Cut (Hz), Low Freq (Hz), Low Gain (dB), Mid 1 Freq, Mid 1 Gain,
+## Mid 1 Q, Mid 2 Freq, Mid 2 Gain, Mid 2 Q, High Freq, High Gain,
+## High Cut (Hz), Slope (12|24 dB), Output (dB).
+pub func eq(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let m = s.line
+    let output = decibels(clampf(p.params[13], -24.0, 24.0))
+    if m.length < 64:
+        for i in 0..<p.frames:
+            left[i] = left_in[i] * output
+            right[i] = right_in[i] * output
+        return
+    var bands: Band[8]
+    let steep = p.params[12] > 0.5
+    let low = clampf(p.params[0], 10.0, 2000.0)
+    let high = clampf(p.params[11], 500.0, 22000.0)
+    bands[0] = low_cut(low, p.rate)
+    bands[0].on = low > 10.5
+    bands[1] = bands[0]
+    bands[1].on = bands[0].on and steep
+    bands[2] = low_shelf(clampf(p.params[1], 20.0, 1000.0), clampf(p.params[2], -24.0, 24.0), p.rate)
+    bands[2].on = absf(p.params[2]) > 0.01
+    bands[3] = bell(clampf(p.params[3], 20.0, 20000.0), clampf(p.params[4], -24.0, 24.0), clampf(p.params[5], 0.1, 18.0), p.rate)
+    bands[3].on = absf(p.params[4]) > 0.01
+    bands[4] = bell(clampf(p.params[6], 20.0, 20000.0), clampf(p.params[7], -24.0, 24.0), clampf(p.params[8], 0.1, 18.0), p.rate)
+    bands[4].on = absf(p.params[7]) > 0.01
+    bands[5] = high_shelf(clampf(p.params[9], 500.0, 20000.0), clampf(p.params[10], -24.0, 24.0), p.rate)
+    bands[5].on = absf(p.params[10]) > 0.01
+    bands[6] = high_cut(high, p.rate)
+    bands[6].on = high < 21900.0 and high < p.rate * 0.47
+    bands[7] = bands[6]
+    bands[7].on = bands[6].on and steep
+    for i in 0..<p.frames:
+        var l = left_in[i]
+        var r = right_in[i]
+        for b: usize in 0..<8:
+            if bands[b].on:
+                l = run(&bands[b], m, b * 4, l)
+                r = run(&bands[b], m, b * 4 + 2, r)
+        left[i] = l * output
+        right[i] = r * output
+
+## The level (dB) a band gives a sine at `hz`, after it settles.
+func response(b: Band, hz: f32) -> f32:
+    var memory: f32[2]
+    let m = memory[0..<2]
+    var peak: f32 = 0.0
+    var phase: f32 = 0.0
+    for n in 0..<96000:
+        phase += hz / 48000.0
+        if phase >= 1.0: phase -= 1.0
+        let y = run(&b, m, 0, dsp.sin_turns(phase))
+        if n > 48000 and absf(y) > peak: peak = absf(y)
+    return 20.0 * log10(peak)
+
+extern func log10_c as "log10f"(x: f32) -> f32
+func log10(x: f32) -> f32:
+    return log10_c(x)
+
+test "the EQ's bands give the gains they promise":
+    let rate: f32 = 48000.0
+    let up = bell(1000.0, 6.0, 1.0, rate)
+    assert(absf(response(up, 1000.0) - 6.0) < 0.1, "a bell's centre")
+    assert(absf(response(up, 100.0)) < 0.3, "a bell leaves the rest")
+    let low = low_shelf(100.0, -9.0, rate)
+    assert(absf(response(low, 20.0) + 9.0) < 0.5, "a low shelf's floor")
+    assert(absf(response(low, 3000.0)) < 0.2, "a low shelf leaves the highs")
+    let high = high_shelf(8000.0, 4.0, rate)
+    assert(absf(response(high, 18000.0) - 4.0) < 0.6, "a high shelf's top")
+    assert(absf(response(high, 500.0)) < 0.2, "a high shelf leaves the lows")
+    let cut = low_cut(100.0, rate)
+    assert(absf(response(cut, 100.0) + 3.0) < 0.2, "a low cut is -3 dB at its corner")
+    assert(absf(response(cut, 25.0) + 24.0) < 1.0, "and 12 dB an octave below")
+    assert(absf(response(cut, 2000.0)) < 0.1, "and flat above")
+
+# ---------------------------------------------------------------- dynamics
+
+## log10 within 1e-3 dB for our purposes: exponent bits and a quartic.
+inline func log10_fast(x: f32) -> f32:
+    let bits = x.bits()
+    let exponent = (f32)(i32)((bits >> 23) & 255) - 127.0
+    let m = f32.bits((bits & 0x7fffff) | 0x3f800000)
+    let log2 = exponent + (-2.4967738 + (4.0283728 + (-2.0810602 + (0.62881573 - 0.079150366 * m) * m) * m) * m)
+    return log2 * 0.30103
+
+## The coefficient that moves a one-pole 63% of the way in `ms`.
+inline func smoothing(ms: f32, rate: f32) -> f32:
+    let samples = ms * 0.001 * rate
+    if samples < 1.0: return 0.0
+    return exp2(-1.442695 / samples)
+
+## The gain computer (Giannoulis, Massberg & Reiss): the reduction (dB, ≤ 0)
+## for a level `db` over `threshold` at `slope` (1/ratio), soft over `knee`.
+inline func reduction_for(db: f32, threshold: f32, slope: f32, knee: f32) -> f32:
+    let over = db - threshold
+    if knee > 0.0 and 2.0 * absf(over) <= knee:
+        let into = over + knee * 0.5
+        return (slope - 1.0) * into * into / (2.0 * knee)
+    if over > 0.0:
+        return (slope - 1.0) * over
+    return 0.0
+
+## The mixing and mastering compressor, four classic circuits in one:
+## VCA (the SSL G bus: feed-forward, clean, Auto release recovering in two
+## stages — fast after a hit, slow after a long squeeze), FET (the 1176:
+## feedback, very fast, Drive its odd-harmonic bite, ratio 20 its "all
+## buttons"), Opto (the LA-2A: feedback through a light cell, release
+## program-dependent — quick at first, then slower the longer it held),
+## Vari-Mu (Fairchild / Manley: feedback, the ratio growing as it squeezes,
+## Drive its tube warmth). The detector blends peak and RMS, can be high
+## passed (so the kick stops pumping the mix) and keyed from outside;
+## Link ties the sides. Mix blends the dry signal back (parallel).
+## Inputs: left, right, key. Outputs: left, right, reduction (dB, ≤ 0).
+## Params: Model, Threshold (dB), Ratio, Attack (ms), Release (ms), Auto,
+## Knee (dB), Side HPF (Hz), Detect (peak 0 … RMS 1), Link, Makeup (dB),
+## Drive, Mix.
+pub func bus_comp(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let keys = p.inputs[2]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let meter = p.outputs[2]
+    let model = (i32)p.params[0]
+    let threshold = clampf(p.params[1], -60.0, 0.0)
+    let ratio = clampf(p.params[2], 1.0, 30.0)
+    let attack_ms = clampf(p.params[3], 0.02, 200.0)
+    let release_ms = clampf(p.params[4], 10.0, 5000.0)
+    let auto = p.params[5] > 0.5
+    var knee = clampf(p.params[6], 0.0, 24.0)
+    let side_hz = clampf(p.params[7], 10.0, 1000.0)
+    let detect = clampf(p.params[8], 0.0, 1.0)
+    let link = clampf(p.params[9], 0.0, 1.0)
+    let makeup = decibels(clampf(p.params[10], -24.0, 30.0))
+    let drive = clampf(p.params[11], 0.0, 1.0)
+    let wet = clampf(p.params[12], 0.0, 1.0)
+    let feedback = model != 0
+    if model == 3 and knee < 15.0: knee = 15.0
+    let attack = smoothing(attack_ms, p.rate)
+    # Program-dependent release: from `fast` toward `slow` as the charge
+    # (how long it has been squeezing) builds.
+    var fast = release_ms
+    var slow = release_ms
+    if model == 2:
+        fast = 60.0
+        slow = release_ms
+    elif auto:
+        fast = 100.0
+        slow = 1200.0
+    let program = model == 2 or auto
+    let fast_release = smoothing(fast, p.rate)
+    let slow_release = smoothing(slow, p.rate)
+    let charge_up = smoothing(800.0, p.rate)
+    let charge_down = smoothing(3000.0, p.rate)
+    let rms = smoothing(15.0, p.rate)
+    let hp = analog.one_pole(side_hz, p.rate)
+    let filtered = side_hz > 10.5
+    let slope = 1.0 / ratio
+    for i in 0..<p.frames:
+        let dry_l = left_in[i]
+        let dry_r = right_in[i]
+        # What the detector hears: the key, the input, or (feedback) the output.
+        var dl = dry_l
+        var dr = dry_r
+        if p.wired[2]:
+            dl = keys[i]
+            dr = keys[i]
+        elif feedback:
+            dl = s.damp[4]
+            dr = s.damp[5]
+        if filtered:
+            s.damp[0] = s.damp[0] + (dl - s.damp[0]) * hp
+            dl = dl - s.damp[0]
+            s.damp[1] = s.damp[1] + (dl - s.damp[1]) * hp
+            dl = dl - s.damp[1]
+            s.damp[2] = s.damp[2] + (dr - s.damp[2]) * hp
+            dr = dr - s.damp[2]
+            s.damp[3] = s.damp[3] + (dr - s.damp[3]) * hp
+            dr = dr - s.damp[3]
+        s.damp[10] = dl * dl + (s.damp[10] - dl * dl) * rms
+        s.damp[11] = dr * dr + (s.damp[11] - dr * dr) * rms
+        let level_l = 20.0 * log10_fast(absf(dl) + 1.0e-9) * (1.0 - detect) + 10.0 * log10_fast(s.damp[10] + 1.0e-18) * detect
+        let level_r = 20.0 * log10_fast(absf(dr) + 1.0e-9) * (1.0 - detect) + 10.0 * log10_fast(s.damp[11] + 1.0e-18) * detect
+        let loudest = level_l if level_l > level_r else level_r
+        var gains: f32[2]
+        for side: usize in 0..<2:
+            let own = level_l if side == 0 else level_r
+            let db = own + (loudest - own) * link
+            # A vari-mu's ratio grows with the squeeze.
+            var side_slope = slope
+            if model == 3:
+                let deep = clampf((db - threshold) / 18.0, 0.0, 1.0)
+                side_slope = 1.0 + (slope - 1.0) * (0.35 + 0.65 * deep)
+            let wanted = reduction_for(db, threshold, side_slope, knee)
+            var gr = s.damp[6 + side]
+            var charge = s.damp[12 + side]
+            if wanted < gr:
+                gr = wanted + (gr - wanted) * attack
+            else:
+                var coef = fast_release
+                if program:
+                    coef = fast_release + (slow_release - fast_release) * charge
+                gr = wanted + (gr - wanted) * coef
+            if program:
+                let squeezing: f32 = 1.0 if gr < -1.0 else 0.0
+                charge = squeezing + (charge - squeezing) * (charge_up if squeezing > charge else charge_down)
+            s.damp[6 + side] = gr
+            s.damp[12 + side] = charge
+            gains[side] = gr
+        var yl = dry_l * decibels(gains[0])
+        var yr = dry_r * decibels(gains[1])
+        # The circuit's own color, deeper as it squeezes.
+        if drive > 0.0:
+            let squeeze = clampf(-0.5 * (gains[0] + gains[1]), 0.0, 24.0)
+            let push = 1.0 + drive * (0.5 + squeeze * 0.12)
+            if model == 1:
+                yl = analog.tanh(yl * push) / push
+                yr = analog.tanh(yr * push) / push
+            elif model == 0:
+                yl = analog.tanh(yl * (1.0 + drive * 0.5)) / (1.0 + drive * 0.5)
+                yr = analog.tanh(yr * (1.0 + drive * 0.5)) / (1.0 + drive * 0.5)
+            else:
+                yl = analog.diode_clip(yl * push, 0.25) / push
+                yr = analog.diode_clip(yr * push, 0.25) / push
+        s.damp[4] = yl
+        s.damp[5] = yr
+        yl = yl * makeup
+        yr = yr * makeup
+        left[i] = dry_l + (yl - dry_l) * wet
+        right[i] = dry_r + (yr - dry_r) * wet
+        if meter.length > 0: meter[i] = 0.5 * (gains[0] + gains[1])
+
+## The limiter's longest look ahead (s).
+let most_lookahead: f32 = 0.005
+
+## A mastering limiter: nothing passes the Ceiling. It looks ahead (the
+## audio is delayed by Lookahead) so the gain is already down when a peak
+## arrives — a held minimum of the gain each sample needs, smoothed by a
+## moving average exactly as long as the delay, so it never overshoots and
+## never clicks (Signalsmith's design). Peaks between samples are guessed
+## from four neighbours (true peak, roughly). Release lets go; Auto lets
+## go slower the longer it has been limiting, so a dense master does not
+## pump. Soft Clip rounds the loudest peaks before the limiter.
+## Inputs: left, right. Outputs: left, right, reduction (dB, ≤ 0).
+## Params: Input (dB), Ceiling (dB), Release (ms), Lookahead (ms), Auto,
+## Soft Clip, Link.
+pub func limiter(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let meter = p.outputs[2]
+    let input = decibels(clampf(p.params[0], -12.0, 30.0))
+    let ceiling = decibels(clampf(p.params[1], -24.0, 0.0))
+    let release_ms = clampf(p.params[2], 1.0, 2000.0)
+    let ahead = (usize)(clampf(p.params[3], 0.1, most_lookahead * 1000.0) * 0.001 * p.rate)
+    let auto = p.params[4] > 0.5
+    let clip = clampf(p.params[5], 0.0, 1.0)
+    let link = clampf(p.params[6], 0.0, 1.0)
+    let length = (usize)(most_lookahead * p.rate) + 8
+    let line = s.line
+    if line.length < 3 * length or ahead < 1:
+        for i in 0..<p.frames:
+            left[i] = clampf(left_in[i] * input, -ceiling, ceiling)
+            right[i] = clampf(right_in[i] * input, -ceiling, ceiling)
+        return
+    # A new lookahead starts the averaging over.
+    if (usize)s.stage != ahead:
+        s.stage = (u32)ahead
+        for k in 0..<length: line[2 * length + k] = 1.0
+        s.a = (f64)ahead
+        s.b = 1.0
+        s.c = 0.0
+        s.heads[2] = 0
+    let release = smoothing(release_ms, p.rate)
+    let slower = smoothing(release_ms * 4.0, p.rate)
+    let charge_rate = smoothing(1000.0, p.rate)
+    var sum = s.a
+    var held = (f32)s.b
+    var hold = (i64)s.c
+    var charge = (f32)s.d
+    for i in 0..<p.frames:
+        var xl = left_in[i] * input
+        var xr = right_in[i] * input
+        if clip > 0.0:
+            # Round what nears the ceiling, the rest untouched.
+            let knee = ceiling * (1.0 - 0.5 * clip)
+            if absf(xl) > knee: xl = (knee + (ceiling * 1.5 - knee) * analog.tanh((absf(xl) - knee) / (ceiling * 1.5 - knee))) * (1.0 if xl > 0.0 else -1.0)
+            if absf(xr) > knee: xr = (knee + (ceiling * 1.5 - knee) * analog.tanh((absf(xr) - knee) / (ceiling * 1.5 - knee))) * (1.0 if xr > 0.0 else -1.0)
+        # The peaks, with the one between this sample and the last guessed
+        # from four neighbours.
+        let between_l = (-s.damp[0] + 9.0 * s.damp[1] + 9.0 * s.damp[2] - xl) * 0.0625
+        let between_r = (-s.damp[3] + 9.0 * s.damp[4] + 9.0 * s.damp[5] - xr) * 0.0625
+        s.damp[0] = s.damp[1]
+        s.damp[1] = s.damp[2]
+        s.damp[2] = xl
+        s.damp[3] = s.damp[4]
+        s.damp[4] = s.damp[5]
+        s.damp[5] = xr
+        var peak_l = absf(xl) if absf(xl) > absf(between_l) else absf(between_l)
+        var peak_r = absf(xr) if absf(xr) > absf(between_r) else absf(between_r)
+        let both = peak_l if peak_l > peak_r else peak_r
+        peak_l = peak_l + (both - peak_l) * link
+        peak_r = peak_r + (both - peak_r) * link
+        let peak = peak_l if peak_l > peak_r else peak_r
+        let need = ceiling / peak if peak > ceiling else 1.0
+        # Hold the lowest gain needed for the look-ahead, then let go.
+        if need <= held:
+            held = need
+            hold = (i64)ahead
+        elif hold > 0:
+            hold -= 1
+        else:
+            let coef = release + (slower - release) * charge if auto else release
+            held = need + (held - need) * coef
+        let limiting: f32 = 1.0 if held < 0.9 else 0.0
+        charge = limiting + (charge - limiting) * charge_rate
+        # The moving average of the held gain over the look-ahead.
+        let at = (usize)s.heads[2]
+        let box_start = 2 * length
+        var oldest = (usize)at + length - ahead
+        if oldest >= length: oldest -= length
+        sum += (f64)held - (f64)line[box_start + oldest]
+        line[box_start + at] = held
+        s.heads[2] = (u32)(at + 1 if at + 1 < length else 0)
+        let gain = clampf((f32)(sum / (f64)ahead), 0.0, 1.0)
+        put(line, 0, length, &s.heads[0], xl)
+        put(line, length, length, &s.heads[1], xr)
+        let yl = tap(line, 0, length, s.heads[0], ahead + 1) * gain
+        let yr = tap(line, length, length, s.heads[1], ahead + 1) * gain
+        left[i] = clampf(yl, -ceiling, ceiling)
+        right[i] = clampf(yr, -ceiling, ceiling)
+        if meter.length > 0: meter[i] = 20.0 * log10_fast(gain + 1.0e-9)
+    s.a = sum
+    s.b = (f64)held
+    s.c = (f64)hold
+    s.d = (f64)charge
+
+## Run a dynamics kernel over a long stereo signal made by `make`, block by
+## block; answer the loudest output sample after `settle` samples and the
+## output level (dB peak) over the last 4800.
+func drive_kernel(kind: i32, params: f32[16], make: func(usize) -> f32, total: usize, settle: usize) -> (f32, f32):
+    var memory: f32[1200]
+    var state: State
+    state.line = memory[0..<1200]
+    var left_in: f32[64]
+    var right_in: f32[64]
+    var left_out: f32[64]
+    var right_out: f32[64]
+    var meter: f32[64]
+    var ports: Ports
+    ports.rate = 48000.0
+    ports.params = params
+    ports.wired[0] = true
+    ports.wired[1] = true
+    var loudest: f32 = 0.0
+    var tail: f32 = 0.0
+    var n: usize = 0
+    while n < total:
+        for i: usize in 0..<64:
+            left_in[i] = make(n + i)
+            right_in[i] = make(n + i) * 0.8
+        ports.frames = 64
+        ports.inputs[0] = left_in[0..<64]
+        ports.inputs[1] = right_in[0..<64]
+        ports.outputs[0] = left_out[0..<64]
+        ports.outputs[1] = right_out[0..<64]
+        ports.outputs[2] = meter[0..<64]
+        if kind == 0: bus_comp(&state, &ports)
+        else: limiter(&state, &ports)
+        for i: usize in 0..<64:
+            let a = absf(left_out[i]) if absf(left_out[i]) > absf(right_out[i]) else absf(right_out[i])
+            if n + i >= settle and a > loudest: loudest = a
+            if n + i >= total - 4800 and a > tail: tail = a
+        n += 64
+    return (loudest, 20.0 * log10_fast(tail))
+
+func loud_saw(n: usize) -> f32:
+    # A saw at 997 Hz, 12 dB over full scale, with a burst every 0.1 s.
+    let t = (f32)(n % 48) / 48.0
+    let burst: f32 = 2.0 if n % 4800 < 30 else 1.0
+    return (8.0 * t - 4.0) * burst
+
+func sine_at_minus_10(n: usize) -> f32:
+    return 0.31622777 * dsp.sin_turns((f32)(n % 480) / 48.0)
+
+test "the limiter never passes its ceiling":
+    var params: f32[16]
+    params[1] = -1.0
+    params[2] = 50.0
+    params[3] = 1.5
+    params[4] = 1.0
+    params[6] = 1.0
+    let (loudest, _) = drive_kernel(1, params, loud_saw, 48000, 0)
+    assert(loudest <= decibels(-1.0) + 0.00001, "a sample over the ceiling")
+    params[5] = 1.0
+    let (clipped, _) = drive_kernel(1, params, loud_saw, 48000, 0)
+    assert(clipped <= decibels(-1.0) + 0.00001, "over the ceiling with soft clip")
+
+test "the compressor's static curve: 4:1 above -20 dB":
+    var params: f32[16]
+    params[0] = 0.0
+    params[1] = -20.0
+    params[2] = 4.0
+    params[3] = 1.0
+    params[4] = 100.0
+    params[6] = 0.0
+    params[9] = 1.0
+    params[10] = 0.0
+    params[12] = 1.0
+    # -10 dB in: 10 over, 2.5 over after → -17.5 dB out (peak detection).
+    let (_, out) = drive_kernel(0, params, sine_at_minus_10, 96000, 0)
+    assert(absf(out + 17.5) < 0.3, "4:1 lands at -17.5")
+    # Below the threshold it does nothing.
+    params[1] = -5.0
+    let (_, untouched) = drive_kernel(0, params, sine_at_minus_10, 96000, 0)
+    assert(absf(untouched + 10.0) < 0.05, "below threshold, unity")
+
+test "every compressor model stays bounded when hammered":
+    for model in 0..<4:
+        var params: f32[16]
+        params[0] = (f32)model
+        params[1] = -30.0
+        params[2] = 20.0
+        params[3] = 0.05
+        params[4] = 50.0
+        params[5] = 1.0
+        params[6] = 6.0
+        params[7] = 120.0
+        params[8] = 0.5
+        params[9] = 0.5
+        params[10] = 12.0
+        params[11] = 1.0
+        params[12] = 1.0
+        let (loudest, _) = drive_kernel(0, params, loud_saw, 48000, 4800)
+        assert(loudest == loudest and loudest < 40.0, "a model ran away")

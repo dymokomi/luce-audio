@@ -1,0 +1,117 @@
+## Opens the default output device duplex: 64-frame buffers, outputs held at
+## silence, two inputs recorded (never sent to the outputs). After about three
+## seconds it writes what the device gave to a report: the device list, rate,
+## buffer, input and output latency, callbacks, input failures, and each
+## input's peak and RMS. Built as an application so that `open` starts it
+## through LaunchServices. Arguments: [report path] [first input, from 0]
+## [inputs] [frames].
+import io
+import thread
+import strings
+from luce_std import collections, files, math
+from luce_audio import device
+from luce_audio.device import Device, Block, DeviceInfo
+
+let default_report = "/private/tmp/claude-501/-Users-sedov/6a575a6e-46b4-428b-bedb-c7d6d1806761/scratchpad/input/report.txt"
+
+struct Meter:
+    var peaks: f64[8]
+    var squares: f64[8]
+    var frames: u64
+    var failed_blocks: u64
+    var channels_seen: usize
+
+## Silence out; measure in. Runs on the device thread.
+func render(context: void*?, block: Block*):
+    for channel in 0..<block.channels:
+        let out = block.output(channel)
+        for i in 0..<block.frames: out[i] = 0.0
+    let meter = (Meter*)(context else return)
+    if block.input_failed:
+        meter.failed_blocks += 1
+    meter.channels_seen = block.input_channels
+    for channel in 0..<block.input_channels:
+        let samples = block.input(channel)
+        var peak = meter.peaks[channel]
+        var sum = meter.squares[channel]
+        for i in 0..<samples.length:
+            let x = (f64)samples[i]
+            let magnitude = -x if x < 0.0 else x
+            if magnitude > peak: peak = magnitude
+            sum += x * x
+        meter.peaks[channel] = peak
+        meter.squares[channel] = sum
+    meter.frames += (u64)block.frames
+
+func refuse(id: u32, sink: io.Writer) -> !:
+    var named: u8[128]
+    var opened = Device.open(render, none, frames = 64, inputs = 2, device_id = id) catch failure:
+        _ = try sink.write(f"duplex on {device.device_name(id, named)} refused, as it should be: {failure.message}\n")
+        return
+    opened.close()
+    _ = try sink.write(f"duplex on {device.device_name(id, named)} was NOT refused\n")
+
+func decibels(level: f64) -> f64:
+    if level <= 0.0:
+        return -999.0
+    return 20.0 * math.log10(level)
+
+pub func main(arguments: str[]) -> i32!:
+    var path = default_report
+    var first: u32 = 0
+    var count: u32 = 2
+    var frames: u32 = 64
+    if arguments.length > 1: path = arguments[1]
+    if arguments.length > 2: first = (u32)(strings.parse_i64(arguments[2]) else 0)
+    if arguments.length > 3: count = (u32)(strings.parse_i64(arguments[3]) else 2)
+    if arguments.length > 4: frames = (u32)(strings.parse_i64(arguments[4]) else 64)
+    var report: collections.Buffer
+    defer report.destroy()
+    let sink: io.Writer = &report
+    var found: DeviceInfo[16]
+    let total = device.devices(found[0..<16]) catch failure:
+        _ = try sink.write(f"devices: {failure.message}\n")
+        recover 0
+    let output_id = device.default_output() catch failure:
+        recover 0
+    _ = try sink.write(f"devices ({total}); default output {output_id}, default input {device.default_input()}\n")
+    for i in 0..<total:
+        if i >= 16: break
+        _ = try sink.write(f"  {found[i].id}: {found[i].name()}, {found[i].inputs} in, {found[i].outputs} out\n")
+    # Written as it goes, so a hang shows where it stopped.
+    try files.write_text(path, report.text())
+    # A device without inputs must be refused cleanly, before anything opens.
+    for i in 0..<total:
+        if i >= 16: break
+        if found[i].inputs == 0 and found[i].outputs > 0:
+            try refuse(found[i].id, sink)
+            break
+    _ = try sink.write(f"opening the default output with {count} inputs from input {first + 1}, {frames} frames\n")
+    try files.write_text(path, report.text())
+    var meter = Meter(peaks = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], squares = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], frames = 0, failed_blocks = 0, channels_seen = 0)
+    var duplex = Device.open(render, &meter, frames = frames, channels = 2, inputs = count, first_input = first) catch failure:
+        _ = try sink.write(f"open failed: {failure.message}\n")
+        try files.write_text(path, report.text())
+        return 1
+    defer duplex.close()
+    var named: u8[128]
+    let rate = duplex.sample_rate
+    _ = try sink.write(f"device {duplex.device_id} ({device.device_name(duplex.device_id, named)}): {rate} Hz, {duplex.device_inputs} inputs\n")
+    _ = try sink.write(f"buffer {duplex.buffer_frames} frames ({f64(duplex.buffer_frames) / rate * 1000.0:.3f} ms)\n")
+    _ = try sink.write(f"recording inputs {duplex.first_input + 1}-{duplex.first_input + duplex.input_channels}\n")
+    _ = try sink.write(f"input latency {duplex.input_latency} frames ({f64(duplex.input_latency) / rate * 1000.0:.3f} ms: device + safety offset + buffer)\n")
+    _ = try sink.write(f"output latency {duplex.output_latency} frames ({f64(duplex.output_latency) / rate * 1000.0:.3f} ms: device + safety offset; plus the buffer {duplex.buffer_frames})\n")
+    let round_trip = duplex.input_latency + duplex.output_latency + duplex.buffer_frames
+    _ = try sink.write(f"round trip {round_trip} frames ({f64(round_trip) / rate * 1000.0:.3f} ms)\n")
+    try files.write_text(path, report.text())
+    try duplex.start()
+    thread.sleep(3000)
+    duplex.stop()
+    _ = try sink.write(f"callbacks {duplex.callbacks()}, frames {meter.frames} ({f64(meter.frames) / rate:.3f} s)\n")
+    _ = try sink.write(f"input render failures {duplex.input_failures()} (blocks flagged {meter.failed_blocks}); channels per block {meter.channels_seen}\n")
+    for channel in 0..<(usize)duplex.input_channels:
+        let peak = meter.peaks[channel]
+        let rms = math.sqrt(meter.squares[channel] / f64(meter.frames)) if meter.frames > 0 else 0.0
+        _ = try sink.write(f"input {(usize)duplex.first_input + channel + 1}: peak {peak:.6f} ({decibels(peak):.1f} dBFS), rms {rms:.6f} ({decibels(rms):.1f} dBFS)\n")
+    try files.write_text(path, report.text())
+    return 0

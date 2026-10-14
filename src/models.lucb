@@ -1,0 +1,1133 @@
+## The analog models: filters, oscillators, amplifiers and voices after the
+## circuits of the Minimoog, SEM, CS-80, MS-20, TB-303, Rhodes, the TR-808
+## and 909, and the Elektron boxes, each at the cheapest cost that keeps its
+## character. Design notes and sources: reports/Analog synth component
+## emulation.md. Like dsp, nothing here allocates or traps.
+import dsp
+import analog
+import effects
+from dsp import State, Ports, Signal, clampf, absf, exp2, tan_turns, decibels
+
+# ---------------------------------------------------------------- ladder
+
+## A 4-pole transistor ladder (Moog Model D, AJH MiniMod, Elektron A4):
+## a zero-delay-feedback cascade of four TPT one-poles with one tanh after
+## the feedback sum, solved by one linearization (Zavalishin §5.3, §6.6),
+## run at twice the rate between halfbands. Resonance 1 self-oscillates;
+## Bass puts back the low end resonance takes away; Drive pushes the
+## saturator; Slop detunes the cutoff a little per voice.
+## Inputs: in, cutoff (octaves), resonance (added). Params: Cutoff, Resonance,
+## Drive (dB), Bass, Mode (LP24, LP12, BP, HP), Slop.
+pub func ladder(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let reson = p.inputs[2]
+    let out = p.outputs[0]
+    let cutoff = p.params[0] * exp2(s.variation * p.params[5] * 0.07)
+    let resonance = p.params[1]
+    let drive = decibels(p.params[2])
+    let bass = clampf(p.params[3], 0.0, 1.0)
+    let mode = (i32)p.params[4]
+    let makeup = 1.0 / (0.3 + 0.7 * drive)
+    let rate = p.rate * 2.0
+    let top = p.rate * 0.45
+    var s1 = (f32)s.more[0]
+    var s2 = (f32)s.more[1]
+    var s3 = (f32)s.more[2]
+    var s4 = (f32)s.more[3]
+    let up = analog.band(s.bands, 0)
+    let down = analog.band(s.bands, 1)
+    var a = ladder_gain(clampf(cutoff, 10.0, top), rate)
+    var k = clampf(resonance, 0.0, 1.05) * 4.0
+    let moving = p.wired[1] or p.wired[2]
+    var seed = s.seed
+    for i in 0..<p.frames:
+        if moving:
+            var fc = cutoff
+            if p.wired[1]: fc = cutoff * exp2(moves[i])
+            a = ladder_gain(clampf(fc, 10.0, top), rate)
+            var r = resonance
+            if p.wired[2]: r = resonance + reson[i]
+            k = clampf(r, 0.0, 1.05) * 4.0
+        let a2 = a * a
+        let a3 = a2 * a
+        let inv = 1.0 / (1.0 + k * a2 * a2)
+        let boost = drive * (1.0 + k * bass)
+        # Thermal noise at -100 dB: what a self-oscillating ladder starts from.
+        let (x0, x1) = analog.upsample(up, source[i] + dsp.white(&seed) * 0.00001)
+        var result: f32[2]
+        var half: usize = 0
+        while half < 2:
+            let x = x0 if half == 0 else x1
+            let sum = a3 * s1 + a2 * s2 + a * s3 + s4
+            let u = analog.tanh((x * boost - k * sum) * inv)
+            var v = (u - s1) * a
+            let y1 = v + s1
+            s1 = y1 + v
+            v = (y1 - s2) * a
+            let y2 = v + s2
+            s2 = y2 + v
+            v = (y2 - s3) * a
+            let y3 = v + s3
+            s3 = y3 + v
+            v = (y3 - s4) * a
+            let y4 = v + s4
+            s4 = y4 + v
+            var y = y4
+            if mode == 1:
+                y = y2
+            elif mode == 2:
+                y = (y2 - 2.0 * y3 + y4) * 4.0
+            elif mode == 3:
+                y = u - 4.0 * y1 + 6.0 * y2 - 4.0 * y3 + y4
+            result[half] = y
+            half += 1
+        out[i] = analog.downsample(down, result[0], result[1]) * makeup
+    s.seed = seed
+    s.more[0] = (f64)s1
+    s.more[1] = (f64)s2
+    s.more[2] = (f64)s3
+    s.more[3] = (f64)s4
+
+## A TPT one-pole's instantaneous gain G = g / (1 + g), g = tan(π fc / rate).
+inline func ladder_gain(fc: f32, rate: f32) -> f32:
+    let g = tan_turns(fc / rate * 0.5)
+    return g / (1.0 + g)
+
+# ---------------------------------------------------------------- state-variable filters
+
+## A mismatched diode pair's resistance (OB-Xd's Taylor polynomial, via
+## Surge): odd terms make the damping asymmetric, a touch of even harmonics.
+inline func diode_pair(x: f32) -> f32:
+    return (((0.0103592 * x + 0.00920833) * x + 0.185) * x + 0.05) * x + 1.0
+
+## One sample of the OB-Xd 2-pole: a TPT state-variable filter whose damping
+## grows with the bandpass state, so loud resonance compresses softly (the
+## SEM's cream) instead of clipping. `g` = tan(π fc / rate), `damping` = 1 -
+## resonance, `push` lets it self-oscillate. Answers (high, band, low).
+inline func sem_step(x: f32, g: f32, damping: f32, push: f32, s1: f32*, s2: f32*) -> (f32, f32, f32):
+    let shape = diode_pair(*s1 * 0.5) - 1.0 - push
+    let r = damping + shape
+    let high = (x - 2.0 * *s1 * r - g * *s1 - *s2) / (1.0 + g * (2.0 * r + g))
+    let band = high * g + *s1
+    *s1 = high * g + band
+    let low = band * g + *s2
+    *s2 = band * g + low
+    return (high, band, low)
+
+## tan(π fc / rate) with fc kept between 8 Hz and `top` (at most 0.46 rate).
+inline func prewarp(fc: f32, rate: f32, top: f32 = 0.0) -> f32:
+    let most = rate * 0.46 if top <= 0.0 or top > rate * 0.46 else top
+    return tan_turns(clampf(fc, 8.0, most) / rate * 0.5)
+
+## The Oberheim SEM / OB-6 2-pole state-variable filter: Mode sweeps low
+## pass through notch to high pass (a modulation input moves it too); Band
+## switches the sweep to low → band → high. Resonance past 1 lets it sing.
+## Inputs: in, cutoff (octaves), resonance (added), mode (added).
+## Params: Cutoff, Resonance, Mode, Band, Drive (dB), Slop.
+pub func sem(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let reson = p.inputs[2]
+    let modes = p.inputs[3]
+    let out = p.outputs[0]
+    let cutoff = p.params[0] * exp2(s.variation * p.params[5] * 0.07)
+    let band_mode = p.params[3] > 0.5
+    let drive = decibels(p.params[4])
+    let makeup = 1.0 / (0.4 + 0.6 * drive)
+    var s1 = (f32)s.more[0]
+    var s2 = (f32)s.more[1]
+    var g = prewarp(cutoff, p.rate)
+    for i in 0..<p.frames:
+        if p.wired[1]:
+            g = prewarp(cutoff * exp2(moves[i]), p.rate)
+        var resonance = p.params[1]
+        if p.wired[2]: resonance = resonance + reson[i]
+        resonance = clampf(resonance, 0.0, 1.1)
+        let push: f32 = 0.035 if resonance > 1.0 else 0.0
+        let damping = clampf(1.0 - resonance, 0.0, 1.0)
+        var m = p.params[2]
+        if p.wired[3]: m = m + modes[i]
+        m = clampf(m, 0.0, 1.0)
+        let (high, band, low) = sem_step(analog.tanh(source[i] * drive * 0.5) * 2.0, g, damping, push, &s1, &s2)
+        var y: f32 = 0.0
+        if band_mode:
+            y = (0.5 - m) * 2.0 * low + m * 2.0 * band if m < 0.5 else (1.0 - m) * 2.0 * band + (m - 0.5) * 2.0 * high
+        else:
+            y = ((1.0 - m) * low + m * high) * (1.0 + (1.0 - absf(m * 2.0 - 1.0)))
+        out[i] = y * 0.37 * makeup
+    s.more[0] = (f64)s1
+    s.more[1] = (f64)s2
+
+## The Yamaha CS-80's filter, per layer: a resonant 12 dB high pass into a
+## resonant 12 dB low pass (two state-variable filters with the creamy
+## nonlinear damping). The cutoff input moves both; the low input only the
+## low pass (an envelope, touch).
+## Inputs: in, cutoff (octaves, both), low (octaves, low pass only).
+## Params: High Cutoff, High Resonance, Low Cutoff, Low Resonance, Drive, Slop.
+pub func twin(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let lows = p.inputs[2]
+    let out = p.outputs[0]
+    let slop = exp2(s.variation * p.params[5] * 0.07)
+    let high_cut = p.params[0] * slop
+    let low_cut = p.params[2] * slop
+    let high_damp = clampf(1.0 - p.params[1], 0.02, 1.0)
+    let low_damp = clampf(1.0 - p.params[3], 0.02, 1.0)
+    let drive = decibels(p.params[4])
+    let makeup = 1.0 / (0.4 + 0.6 * drive)
+    var h1 = (f32)s.more[0]
+    var h2 = (f32)s.more[1]
+    var l1 = (f32)s.more[2]
+    var l2 = (f32)s.more[3]
+    var gh = prewarp(high_cut, p.rate)
+    var gl = prewarp(low_cut, p.rate)
+    for i in 0..<p.frames:
+        if p.wired[1] or p.wired[2]:
+            let shift = moves[i] if p.wired[1] else 0.0
+            let low_shift = lows[i] if p.wired[2] else 0.0
+            gh = prewarp(high_cut * exp2(shift), p.rate)
+            gl = prewarp(low_cut * exp2(shift + low_shift), p.rate)
+        let x = analog.tanh(source[i] * drive * 0.5) * 2.0
+        let (high, _, _) = sem_step(x, gh, high_damp, 0.0, &h1, &h2)
+        let (_, _, low) = sem_step(high, gl, low_damp, 0.0, &l1, &l2)
+        out[i] = low * makeup * 0.7
+    s.more[0] = (f64)h1
+    s.more[1] = (f64)h2
+    s.more[2] = (f64)l1
+    s.more[3] = (f64)l2
+
+# ---------------------------------------------------------------- MS-20
+
+## A TPT one-pole's step: answers its low pass; `z` is its state, `G` its
+## instantaneous gain g/(1+g).
+inline func one_pole_step(x: f32, G: f32, z: f32*) -> f32:
+    let v = (x - *z) * G
+    let y = v + *z
+    *z = y + v
+    return y
+
+## The Korg MS-20 filter pair: a resonant high pass into the Korg35
+## Sallen-Key low pass (Pirkle/Odin2/Surge K35: three one-poles, the loop
+## solved linearly, a diode clipper in it). Flavor: 0 the early Korg35 (the
+## whole signal distorts, gain before the clipper), 1 the later OTA version
+## (only the resonant peak screams). At twice the rate for the screaming.
+## Inputs: in, cutoff (octaves, both), low (octaves, low pass only).
+## Params: High Cutoff, High Peak, Low Cutoff, Low Peak, Drive (dB), Flavor, Slop.
+pub func ms20(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let lows = p.inputs[2]
+    let out = p.outputs[0]
+    let slop = exp2(s.variation * p.params[6] * 0.07)
+    let high_cut = p.params[0] * slop
+    let low_cut = p.params[2] * slop
+    let high_damp = clampf(1.0 - p.params[1], 0.03, 1.0)
+    # Up to 2.2: the hardware's measured largest loop gain (Stinchcombe); the
+    # clipper holds the self-oscillation.
+    let k = clampf(2.2 * p.params[3], 0.01, 2.2)
+    let drive = decibels(p.params[4])
+    let forward = p.params[5] < 0.5
+    let rate = p.rate * 2.0
+    var h1 = (f32)s.more[0]
+    var h2 = (f32)s.more[1]
+    var z1 = (f32)s.more[2]
+    var z2 = (f32)s.more[3]
+    var z3 = (f32)s.more[4]
+    let up = analog.band(s.bands, 0)
+    let down = analog.band(s.bands, 1)
+    let top = p.rate * 0.45
+    var gh = prewarp(high_cut, rate, top)
+    var g = prewarp(low_cut, rate, top)
+    for i in 0..<p.frames:
+        if p.wired[1] or p.wired[2]:
+            let shift = moves[i] if p.wired[1] else 0.0
+            let low_shift = lows[i] if p.wired[2] else 0.0
+            gh = prewarp(high_cut * exp2(shift), rate, top)
+            g = prewarp(low_cut * exp2(shift + low_shift), rate, top)
+        let G = g / (1.0 + g)
+        let lb = (k - k * G) / (1.0 + g)
+        let hb = -1.0 / (1.0 + g)
+        let alpha = 1.0 / (1.0 - k * G + k * G * G)
+        let (x0, x1) = analog.upsample(up, source[i])
+        var result: f32[2]
+        var half: usize = 0
+        while half < 2:
+            var x = x0 if half == 0 else x1
+            let (high, _, _) = sem_step(x, gh, high_damp, 0.0, &h1, &h2)
+            x = high
+            if forward:
+                x = analog.diode_clip(x * drive, 0.05) / analog.tanh(clampf(drive, 1.0, 4.0))
+            else:
+                x = x * drive
+            let y1 = one_pole_step(x, G, &z1)
+            let s35 = lb * z2 + hb * z3
+            var u = alpha * (y1 + s35)
+            u = analog.tanh(u * 1.2) / 1.2 if forward else analog.diode_clip(u * 0.7, 0.03) / 0.7
+            let y = k * one_pole_step(u, G, &z2)
+            # the feedback high pass: its state follows y
+            _ = one_pole_step(y, G, &z3)
+            result[half] = y / k
+            half += 1
+        out[i] = analog.downsample(down, result[0], result[1]) / (0.5 + 0.5 * drive)
+    s.more[0] = (f64)h1
+    s.more[1] = (f64)h2
+    s.more[2] = (f64)z1
+    s.more[3] = (f64)z2
+    s.more[4] = (f64)z3
+
+# ---------------------------------------------------------------- oscillator
+
+## The two-sample polyBLEP residual of a unit step at phase 0, seen at
+## phase `t` (Välimäki; Finke's symmetric form): scale by half the jump.
+pub inline func blep(t: f32, dt: f32) -> f32:
+    if t < dt:
+        let x = t / dt
+        return x + x - x * x - 1.0
+    if t > 1.0 - dt:
+        let x = (t - 1.0) / dt
+        return x * x + x + x + 1.0
+    return 0.0
+
+## The two-sample polyBLAMP residual of a unit corner at phase 0 (Esqueda et
+## al.): scale by the slope change per sample.
+inline func blamp(t: f32, dt: f32) -> f32:
+    if t < dt:
+        let x = t / dt - 1.0
+        return -x * x * x / 3.0
+    if t > 1.0 - dt:
+        let x = (t - 1.0) / dt + 1.0
+        return x * x * x / 3.0
+    return 0.0
+
+## `t` relative to an edge at `edge`, wrapped into 0..1.
+inline func from_edge(t: f32, edge: f32) -> f32:
+    var r = t - edge
+    if r < 0.0: r += 1.0
+    return r
+
+## An analog VCO: a shape that morphs triangle → saw → pulse (Plaits' and the
+## OB-6's continuous shape; Pulse Width also skews the triangle into the
+## Minimoog's shark tooth), alias-suppressed by polyBLEP on its steps and
+## polyBLAMP on its corners; a flip-flop sub-oscillator an octave down; slow
+## drift and a per-voice offset as real VCOs wander; exponential FM, phase
+## modulation and hard sync.
+## Inputs: pitch (octaves), fm (octaves, added), phase (turns), width (added),
+## sync (a rising zero crossing restarts the phase).
+## Params: Octave, Semitones, Fine, Shape, Pulse Width, Sub, Level, Drift,
+## Phase (Free | Reset at note).
+pub func analog_vco(s: State*, p: Ports*):
+    let pitch = p.inputs[0]
+    let fm = p.inputs[1]
+    let pm = p.inputs[2]
+    let widths = p.inputs[3]
+    let syncs = p.inputs[4]
+    let out = p.outputs[0]
+    let shape = clampf(p.params[3], 0.0, 1.0)
+    let width = p.params[4]
+    let sub_level = p.params[5]
+    let level = p.params[6]
+    let drift_cents = p.params[7]
+    # Drift: a slow walk plus this voice's fixed offset, in cents.
+    var wander = (f32)s.d
+    let walk = analog.drift(&wander, &s.seed, p.frames)
+    s.d = (f64)wander
+    let detune = (walk * drift_cents + s.variation * drift_cents * 0.4) / 1200.0
+    let tune = p.params[0] + p.params[1] / 12.0 + p.params[2] / 1200.0 + detune
+    let base = 261.62558 / p.rate
+    let tri_amount = clampf(1.0 - shape * 2.0, 0.0, 1.0)
+    let square_amount = clampf(shape * 2.0 - 1.0, 0.0, 1.0)
+    let saw_amount = 1.0 - tri_amount - square_amount
+    var phase = (f32)s.a
+    var sub = (f32)s.b
+    var last_sync = (f32)s.c
+    # Phase reset at a note's start: the voice's gate rose this block.
+    if p.params[8] > 0.5 and p.frames > 0 and p.gate[0] < 0.5:
+        phase = 0.0
+    for i in 0..<p.frames:
+        var octaves = tune
+        if p.wired[0]: octaves += pitch[i]
+        if p.wired[1]: octaves += fm[i]
+        let dt = clampf(base * exp2(octaves), 0.000001, 0.45)
+        var pw = width
+        if p.wired[3]: pw = pw + widths[i] * 0.5
+        # Edges may not collide: keep the pulse at least two samples wide.
+        pw = clampf(pw, 2.0 * dt, 1.0 - 2.0 * dt)
+        if p.wired[4]:
+            let now = syncs[i]
+            if last_sync <= 0.0 and now > 0.0:
+                phase = 0.0
+            last_sync = now
+        var t = phase
+        if p.wired[2]:
+            t = t + pm[i]
+            t = t - dsp.floorf(t)
+        # The naive shapes.
+        let saw = 2.0 * t - 1.0
+        let square: f32 = 1.0 if t < pw else -1.0
+        let tri = -1.0 + 2.0 * t / pw if t < pw else 1.0 - 2.0 * (t - pw) / (1.0 - pw)
+        # Their corrections: the saw steps -2 at 0; the pulse +2 at 0 and -2
+        # at pw; the triangle turns by 2/pw + 2/(1-pw) at 0 and back at pw.
+        let at_pw = from_edge(t, pw)
+        let saw_fixed = saw - blep(t, dt)
+        # Less the pulse's average (2 pw - 1): a real VCO's output is AC
+        # coupled, so a narrow pulse carries no DC into what follows.
+        let square_fixed = square + blep(t, dt) - blep(at_pw, dt) - (2.0 * pw - 1.0)
+        let turn = (2.0 / pw + 2.0 / (1.0 - pw)) * dt
+        let tri_fixed = tri + turn * blamp(t, dt) - turn * blamp(at_pw, dt)
+        var y = tri_fixed * tri_amount + saw_fixed * saw_amount + square_fixed * square_amount
+        # The sub: a square an octave down, flipping at each wrap.
+        if sub_level > 0.0:
+            let sub_t = 0.5 * t + (0.5 if sub > 0.5 else 0.0)
+            let sub_square: f32 = 1.0 if sub_t < 0.5 else -1.0
+            let sub_fixed = sub_square + blep(sub_t, 0.5 * dt) - blep(from_edge(sub_t, 0.5), 0.5 * dt)
+            y += sub_fixed * sub_level
+        out[i] = y * level
+        phase += dt
+        if phase >= 1.0:
+            phase -= 1.0
+            sub = 1.0 - sub
+    s.a = (f64)phase
+    s.b = (f64)sub
+    s.c = (f64)last_sync
+
+# ---------------------------------------------------------------- envelope and amplifier
+
+extern func c_exp as "exp"(x: f64) -> f64
+extern func c_log as "log"(x: f64) -> f64
+
+## The per-sample coefficient of an RC stage that covers its span in
+## `seconds` aiming `ratio` of the span past its end (EarLevel's form).
+func rc_coefficient(seconds: f32, rate: f32, ratio: f32) -> f32:
+    let samples = (f64)clampf(seconds, 0.0001, 60.0) * (f64)rate
+    return (f32)c_exp(-c_log((1.0 + (f64)ratio) / (f64)ratio) / samples)
+
+## An analog ADSR (CEM3310): the attack charges toward 1.3 of its peak and
+## turns to decay on reaching it, so it starts fast and arrives soft; decay
+## and release fall exponentially. It starts from where it is (a retrigger
+## doesn't drop to zero), and like the CS-80's it may start at Initial and
+## peak at Peak. Velocity, wired, scales the peak.
+## Inputs: gate, velocity. Params: Attack, Decay, Sustain, Release, Curve
+## (the attack's aim past its peak), Initial, Peak, Velocity (amount).
+pub func analog_envelope(s: State*, p: Ports*):
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let velocity = p.inputs[1]
+    let out = p.outputs[0]
+    let sustain = clampf(p.params[2], 0.0, 1.0)
+    let curve = clampf(p.params[4], 0.02, 20.0)
+    let initial = clampf(p.params[5], 0.0, 1.0)
+    let amount = clampf(p.params[7], 0.0, 1.0)
+    let attack_coef = rc_coefficient(p.params[0], p.rate, curve)
+    let decay_coef = rc_coefficient(p.params[1], p.rate, 0.001)
+    let release_coef = rc_coefficient(p.params[3], p.rate, 0.001)
+    var level = (f32)s.a
+    var held = s.b > 0.5
+    var stage = s.stage
+    for i in 0..<p.frames:
+        var peak = clampf(p.params[6], 0.0, 1.0)
+        if p.wired[1]: peak = peak * (1.0 - amount + amount * clampf(velocity[i], 0.0, 1.0))
+        let on = gate[i] > 0.5
+        if on and not held:
+            stage = 1
+            if level < initial: level = initial
+        elif held and not on:
+            stage = 4
+        held = on
+        if stage == 1:
+            let aim = peak + curve * (peak - initial)
+            level = aim + (level - aim) * attack_coef
+            if level >= peak:
+                level = peak
+                stage = 2
+        elif stage == 2:
+            let floor = sustain * peak
+            let aim = floor - 0.001 * (peak - floor)
+            level = aim + (level - aim) * decay_coef
+            if level <= floor:
+                level = floor
+                stage = 3
+        elif stage == 3:
+            level = sustain * peak
+        elif stage == 4:
+            let aim: f32 = -0.001
+            level = aim + (level - aim) * release_coef
+            if level <= 0.0:
+                level = 0.0
+                stage = dsp.idle
+        out[i] = level
+    s.a = (f64)level
+    s.b = 1.0 if held else 0.0
+    s.stage = stage
+
+## An OTA VCA (CA3080 / LM13700): the control sets the gain, linearly as an
+## OTA's current does or exponentially as a Blackmer cell's; the signal
+## through the transconductor saturates as tanh, Asymmetry offsetting it for
+## even harmonics; a closed VCA still bleeds a whisper (-80 dB).
+## Inputs: in, cv (0..1). Params: Gain (dB), Response (Linear | Exponential),
+## Drive (dB), Asymmetry, Bleed (dB).
+pub func ota_vca(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let cv = p.inputs[1]
+    let out = p.outputs[0]
+    let gain = decibels(p.params[0])
+    let exponential = p.params[1] > 0.5
+    let drive = decibels(p.params[2])
+    let bias = clampf(p.params[3], -1.0, 1.0) * 0.3
+    let bleed = decibels(p.params[4])
+    let center = analog.tanh(bias)
+    let undrive = 1.0 / analog.tanh(clampf(drive, 1.0, 5.0)) if drive > 1.0 else 1.0
+    for i in 0..<p.frames:
+        var g: f32 = 1.0
+        if p.wired[1]:
+            let c = clampf(cv[i], 0.0, 1.5)
+            g = exp2((c - 1.0) * 13.29) if exponential else c
+        if g < bleed: g = bleed
+        let x = source[i]
+        let shaped = (analog.tanh(x * drive + bias) - center) * undrive if drive > 1.0 or bias != 0.0 else x
+        out[i] = shaped * g * gain
+
+# ---------------------------------------------------------------- Elektron multimode
+
+## Simper's trapezoidal SVF, one sample: answers (low, band); `high` is
+## x - k band - low. a1 = 1/(1 + g(g+k)), a2 = g a1, a3 = g a2.
+inline func simper(x: f32, g: f32, k: f32, ic1: f32*, ic2: f32*) -> (f32, f32):
+    let a1 = 1.0 / (1.0 + g * (g + k))
+    let a2 = g * a1
+    let a3 = g * a2
+    let v3 = x - *ic2
+    let v1 = a1 * *ic1 + a2 * v3
+    let v2 = *ic2 + a2 * *ic1 + a3 * v3
+    *ic1 = 2.0 * v1 - *ic1
+    *ic2 = 2.0 * v2 - *ic2
+    return (v2, v1)
+
+## The 2-pole multimode of the Analog Rytm, Analog Four (filter 2) and
+## Analog Heat: one state-variable filter, its seven types three-tap mixes
+## (Simper's mixes; LP1 and HP1 the 6 dB types as resonant mixes): LP2, LP1,
+## BP, HP1, HP2, BS (band stop), PK (peak; inverts at the bottom, as the
+## hardware's does).
+## Inputs: in, cutoff (octaves), resonance (added).
+## Params: Mode, Cutoff, Resonance, Slop.
+pub func multimode(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let reson = p.inputs[2]
+    let out = p.outputs[0]
+    let mode = (i32)p.params[0]
+    let cutoff = p.params[1] * exp2(s.variation * p.params[3] * 0.07)
+    var ic1 = (f32)s.more[0]
+    var ic2 = (f32)s.more[1]
+    var g = prewarp(cutoff, p.rate)
+    var k = 2.0 - 2.0 * clampf(p.params[2], 0.0, 0.99)
+    for i in 0..<p.frames:
+        if p.wired[1]: g = prewarp(cutoff * exp2(moves[i]), p.rate)
+        if p.wired[2]: k = 2.0 - 2.0 * clampf(p.params[2] + reson[i], 0.0, 0.99)
+        let x = source[i]
+        let (low, band) = simper(x, g, k, &ic1, &ic2)
+        var y = low
+        if mode == 1: y = k * band + low
+        elif mode == 2: y = band
+        elif mode == 3: y = x - low
+        elif mode == 4: y = x - k * band - low
+        elif mode == 5: y = x - k * band
+        elif mode == 6: y = x - k * band - 2.0 * low
+        out[i] = y
+    s.more[0] = (f64)ic1
+    s.more[1] = (f64)ic2
+
+# ---------------------------------------------------------------- drive
+
+## The Drive's diode: the positive side knees early, the negative late;
+## its antiderivative for ADAA.
+inline func diode(x: f32) -> f32:
+    return analog.tanh(x * 1.4) * 0.72 if x > 0.0 else analog.tanh(x * 0.7) * 1.2
+
+inline func diode_integral(x: f32) -> f32:
+    return analog.log_cosh(x * 1.4) * (0.72 / 1.4) if x > 0.0 else analog.log_cosh(x * 0.7) * (1.2 / 0.7)
+
+inline func diode_adaa(x: f32, previous: f32) -> f32:
+    let d = x - previous
+    if absf(d) < 0.001:
+        return diode(0.5 * (x + previous))
+    return (diode_integral(x) - diode_integral(previous)) / d
+
+## A tanh at gain `k` with ADAA (`x` and `previous` before the gain).
+inline func tanh_k_adaa(x: f32, previous: f32, k: f32) -> f32:
+    return analog.tanh_adaa(x * k, previous * k)
+
+## The shapes the Drive node's circuits use, before their antialiasing.
+inline func fold(x: f32) -> f32:
+    # A sine folder: smooth turns, past ±1 it folds back.
+    return dsp.sin_turns(x * 0.25)
+
+## An OTO BOUM / Elektron Analog Heat style drive: pre-gain and a low cut
+## into one of eight circuits, a DC block, then a 12 dB low pass and a
+## dry/wet mix. Boost: soft (tanh) clip. Tube: tanh pushed off-center for
+## 2nd harmonic. Tape: drive that rises with slew, a warm bump. Mid: a
+## mid-band push into a hard clip. Diode: asymmetric soft knee. Fuzz: high
+## gain into a hard clip, a rectifier rounding it. Square: a comparator.
+## Fold: a wavefolder. Bias (the Rytm's SYM) offsets the signal before the
+## circuit. tanh and the hard clip are antialiased by their antiderivatives;
+## Fuzz, Square and Fold run at twice the rate.
+## Inputs: in, drive (dB, added). Params: Circuit, Drive (dB), Bias, Low
+## Cut (Hz), High Cut (Hz), Mix, Output (dB).
+pub func drive_circuit(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let drives = p.inputs[1]
+    let out = p.outputs[0]
+    let circuit = (i32)p.params[0]
+    let bias = clampf(p.params[2], -1.0, 1.0) * 0.6
+    let low_cut = analog.one_pole(clampf(p.params[3], 5.0, 2000.0), p.rate)
+    let g_high = prewarp(p.params[4], p.rate)
+    let wet = clampf(p.params[5], 0.0, 1.0)
+    let output = decibels(p.params[6])
+
+    let up = analog.band(s.bands, 0)
+    let down = analog.band(s.bands, 1)
+    var hp_state = (f32)s.more[0]
+    var last = (f32)s.more[1]
+    var dc_in = (f32)s.more[2]
+    var dc_out = (f32)s.more[3]
+    var post1 = (f32)s.more[4]
+    var post2 = (f32)s.more[5]
+    var mid1 = (f32)s.more[6]
+    var mid2 = (f32)s.more[7]
+    let center_tanh = analog.tanh(bias)
+    var gain_db = p.params[1]
+    var gain = decibels(gain_db)
+    for i in 0..<p.frames:
+        if p.wired[1]: gain = decibels(gain_db + drives[i])
+        let dry = source[i]
+        # The low cut: what goes into the circuit loses its lows first.
+        hp_state = hp_state + (dry - hp_state) * low_cut
+        var x = (dry - hp_state) * gain
+        var y: f32 = 0.0
+        if circuit == 0:
+            y = analog.tanh_adaa(x, last) - center_tanh * 0.0
+            last = x
+        elif circuit == 1:
+            let biased = x + bias + 0.2
+            y = analog.tanh_adaa(biased, last) - analog.tanh(bias + 0.2)
+            last = biased
+        elif circuit == 2:
+            # Tape: drive rises with the signal's slope; a soft knee.
+            let slew = absf(x - (f32)s.c)
+            s.c = (f64)x
+            let pushed = x * (1.0 + 0.5 * slew) * 0.8 + bias
+            y = (analog.tanh_adaa(pushed, last) - center_tanh) / 0.8
+            last = pushed
+        elif circuit == 4:
+            # Diode: the positive side knees early, the negative late.
+            let biased = x + bias
+            y = diode_adaa(biased, last) - diode(bias)
+            last = biased
+        else:
+            # Mid: a band around 1 kHz pushed 12 dB first.
+            if circuit == 3:
+                let (_, band) = simper(x, 0.0654, 1.4, &mid1, &mid2)
+                x = x + band * 3.0
+            # Twice the rate for the hard circuits.
+            let (x0, x1) = analog.upsample(up, x + bias)
+            var pair: f32[2]
+            var half: usize = 0
+            while half < 2:
+                let v = x0 if half == 0 else x1
+                var w: f32 = 0.0
+                if circuit == 3:
+                    w = analog.hard_clip_adaa(v, last)
+                    last = v
+                elif circuit == 5:
+                    let clipped = analog.hard_clip_adaa(v * 3.0, last)
+                    last = v * 3.0
+                    w = clipped * 0.7 + absf(clipped) * 0.3
+                elif circuit == 6:
+                    # A comparator, softened just enough to stay clean.
+                    w = tanh_k_adaa(v, last, 8.0)
+                    last = v
+                else:
+                    w = fold(v)
+                pair[half] = w
+                half += 1
+            y = analog.downsample(down, pair[0], pair[1])
+        y = analog.dc_block(y, &dc_in, &dc_out, 0.995)
+        # The 12 dB low pass after the circuit.
+        let (smooth, _) = simper(y, g_high, 1.414, &post1, &post2)
+        out[i] = (dry + (smooth - dry) * wet) * output
+    s.more[0] = (f64)hp_state
+    s.more[1] = (f64)last
+    s.more[2] = (f64)dc_in
+    s.more[3] = (f64)dc_out
+    s.more[4] = (f64)post1
+    s.more[5] = (f64)post2
+    s.more[6] = (f64)mid1
+    s.more[7] = (f64)mid2
+
+# ---------------------------------------------------------------- drums
+#
+# The drums start on the voice's gate rising (a note) and take its velocity
+# input as the accent. Their parameters follow the Analog Rytm's names.
+
+## Whether the gate rose at sample `i`, from `held` (updated).
+pub inline func struck(gate: Signal, i: usize, held: f32*) -> bool:
+    let on = gate[i] > 0.5
+    let rose = on and *held < 0.5
+    *held = 1.0 if on else 0.0
+    return rose
+
+## The resonance (Simper's k) that rings for `seconds` (T60) at `hz`.
+inline func ring_damping(hz: f32, seconds: f32) -> f32:
+    let q = 3.14159265 * hz * clampf(seconds, 0.005, 20.0) / 6.9078
+    return clampf(1.0 / q, 0.0002, 2.0)
+
+## A kick: 808, a band-pass resonator pinged by a 1 ms pulse whose pitch
+## jumps an octave and more for the first milliseconds (Sweep) and sighs
+## down as it rings (Sigh), its decay the resonator's (Werner et al.; Plaits'
+## AnalogBassDrum); 909, a triangle VCO shaped toward a sine, its pitch
+## swept down from Sweep octaves, with a click (Plaits' SyntheticBassDrum).
+## Tick is the click, Tone a low pass, Drive a soft clip.
+## Inputs: gate, velocity (accent), pitch (octaves).
+## Params: Model, Tune (Hz), Decay (s), Sweep (octaves), Sweep Time (s),
+## Sigh, Tick, Tone, Drive (dB), Level.
+pub func kick(s: State*, p: Ports*):
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let velocity = p.inputs[1]
+    let pitch = p.inputs[2]
+    let out = p.outputs[0]
+    let model = (i32)p.params[0]
+    let tune = p.params[1]
+    let decay = p.params[2]
+    let sweep = p.params[3]
+    let sweep_time = clampf(p.params[4], 0.001, 1.0)
+    let sigh = p.params[5]
+    let tick = p.params[6]
+    let tone = analog.one_pole(tune * 4.0 * exp2(p.params[7] * 7.0), p.rate)
+    let drive = decibels(p.params[8])
+    let level = p.params[9]
+    let step = 1.0 / p.rate
+    var held = (f32)s.b
+    var time = (f32)s.d
+    var accent = (f32)s.c
+    var ic1 = s.damp[0]
+    var ic2 = s.damp[1]
+    var lp = s.damp[2]
+    var phase = s.damp[3]
+    var hp = s.damp[4]
+    var amp = s.damp[5]
+    var seed = s.seed
+    for i in 0..<p.frames:
+        if struck(gate, i, &held):
+            time = 0.0
+            accent = clampf(velocity[i], 0.0, 1.0) if p.wired[1] else 0.8
+            amp = 1.0
+            if model == 1:
+                phase = 0.25
+        var f = tune
+        if p.wired[2]: f = f * exp2(pitch[i])
+        var y: f32 = 0.0
+        if model == 0:
+            # The pulse, high-passed (the diode shaper's edge).
+            let pulse: f32 = (3.0 + 7.0 * accent) if time < 0.001 else 0.0
+            let edge = pulse - hp
+            hp = hp + edge * 0.15
+            let jump = sweep * dsp.exp2(-time / sweep_time * 1.4427)
+            let sag = 1.0 + sigh * 0.14 * dsp.exp2(-time / 0.3 * 1.4427)
+            let fc = f * exp2(jump) * sag
+            let g = tan_turns(clampf(fc, 10.0, p.rate * 0.4) / p.rate * 0.5)
+            let k = ring_damping(fc, decay)
+            let (_, band) = simper(edge * 0.004, g, k, &ic1, &ic2)
+            y = band * 270.0 + edge * tick * 0.02
+        else:
+            let jump = sweep * dsp.exp2(-time / sweep_time * 1.4427)
+            let dt = clampf(f * exp2(jump) * step, 0.0, 0.45)
+            if time > 0.0013:
+                phase += dt
+                if phase >= 1.0: phase -= 1.0
+            let tri = 1.0 - 4.0 * absf(phase - 0.5)
+            let body = tri * 1.6 / (1.0 + absf(tri * 1.6))
+            amp = dsp.exp2(-time / decay * 9.97)
+            let click = (dsp.white(&seed) * 0.5 + 1.0) * tick * dsp.exp2(-time / 0.004 * 1.4427) if time < 0.03 else 0.0
+            y = body * amp * (0.7 + 0.3 * accent) + click * 0.5
+        lp = lp + (y - lp) * tone
+        let shaped = analog.tanh(lp * drive) / analog.tanh(clampf(drive, 1.0, 4.0)) if drive > 1.0 else lp
+        out[i] = shaped * level
+        time += step
+    s.b = (f64)held
+    s.d = (f64)time
+    s.c = (f64)accent
+    s.damp[0] = ic1
+    s.damp[1] = ic2
+    s.damp[2] = lp
+    s.damp[3] = phase
+    s.damp[4] = hp
+    s.damp[5] = amp
+    s.seed = seed
+
+## Mode ratios of a struck drum head (Plaits' analog snare).
+let snare_modes: f32[5] = [1.0, 2.0, 3.18, 4.16, 5.62]
+
+## A snare: the shell's modes rung by a pulse (808: two, 909: five), and
+## the snappy wires, half-wave rectified noise through a band pass with its
+## own decay. Toms are one mode and no snappy.
+## Inputs: gate, velocity, pitch.
+## Params: Model (808 | 909 | Tom), Tune (Hz), Decay (s), Snappy, Noise
+## Tone (Hz), Noise Decay (s), Sweep (octaves), Drive (dB), Level.
+pub func snare(s: State*, p: Ports*):
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let velocity = p.inputs[1]
+    let pitch = p.inputs[2]
+    let out = p.outputs[0]
+    let model = (i32)p.params[0]
+    let modes: usize = 2 if model == 0 else (5 if model == 1 else 1)
+    let tune = p.params[1]
+    let decay = p.params[2]
+    let snappy = p.params[3] if model != 2 else 0.0
+    let noise_g = tan_turns(clampf(p.params[4], 200.0, 16000.0) / p.rate * 0.5)
+    let noise_decay = clampf(p.params[5], 0.01, 2.0)
+    let sweep = p.params[6]
+    let drive = decibels(p.params[7])
+    let level = p.params[8]
+    let step = 1.0 / p.rate
+    var held = (f32)s.b
+    var time = (f32)s.d
+    var accent = (f32)s.c
+    var seed = s.seed
+    var n1 = (f32)s.more[0]
+    var n2 = (f32)s.more[1]
+    for i in 0..<p.frames:
+        if struck(gate, i, &held):
+            time = 0.0
+            accent = clampf(velocity[i], 0.0, 1.0) if p.wired[1] else 0.8
+        var f = tune * exp2(sweep * dsp.exp2(-time / 0.03 * 1.4427))
+        if p.wired[2]: f = f * exp2(pitch[i])
+        let pulse: f32 = (1.0 + accent) if time < 0.001 else 0.0
+        var shell: f32 = 0.0
+        for m in 0..<modes:
+            let fm = clampf(f * snare_modes[m], 20.0, p.rate * 0.4)
+            let g = tan_turns(fm / p.rate * 0.5)
+            let k = ring_damping(fm, decay * (1.0 if m == 0 else 0.5))
+            var a = s.damp[m * 2]
+            var b = s.damp[m * 2 + 1]
+            let (_, band) = simper(pulse * 0.02, g, k, &a, &b)
+            s.damp[m * 2] = a
+            s.damp[m * 2 + 1] = b
+            shell += band * (60.0 if m == 0 else 30.0) * clampf(fm / 200.0, 0.3, 4.0)
+        var wires: f32 = 0.0
+        if snappy > 0.0:
+            let white = dsp.white(&seed)
+            let rectified = white if white > 0.0 else 0.0
+            let env = dsp.exp2(-time / noise_decay * 9.97)
+            let (_, band) = simper(rectified * env, noise_g, 1.0, &n1, &n2)
+            wires = band * snappy * (0.6 + 0.4 * accent) * 1.5
+        let y = shell * (0.6 + 0.4 * accent) + wires
+        let shaped = analog.tanh(y * drive) / analog.tanh(clampf(drive, 1.0, 4.0)) if drive > 1.0 else analog.tanh(y)
+        out[i] = shaped * level
+        time += step
+    s.b = (f64)held
+    s.d = (f64)time
+    s.c = (f64)accent
+    s.seed = seed
+    s.more[0] = (f64)n1
+    s.more[1] = (f64)n2
+
+## The 808 cymbal's six square oscillators (Plaits' ratios × 414 Hz).
+let metal_ratios: f32[6] = [1.0, 1.304, 1.466, 1.787, 1.932, 2.536]
+
+## Hats, cymbals and a cowbell from the 808's metal: six detuned squares (a
+## cowbell, two at 800/540 Hz) through a band pass, a swing VCA that passes
+## the positive side four times louder, and a high pass.
+## Inputs: gate, velocity.
+## Params: Model (Hat | Cymbal | Cowbell), Tune, Decay (s), Tone, Color
+## (the high pass, Hz), Level.
+pub func metal(s: State*, p: Ports*):
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let velocity = p.inputs[1]
+    let out = p.outputs[0]
+    let model = (i32)p.params[0]
+    let tune = p.params[1]
+    let decay = p.params[2]
+    let tone_hz = 150.0 * exp2(clampf(p.params[3], 0.0, 1.0) * 6.0)
+    let g_band = tan_turns(clampf(tone_hz, 100.0, p.rate * 0.4) / p.rate * 0.5)
+    let high = analog.one_pole(clampf(p.params[4], 500.0, 16000.0), p.rate)
+    let level = p.params[5]
+    let step = 1.0 / p.rate
+    var held = (f32)s.b
+    var time = (f32)s.d
+    var accent = (f32)s.c
+    var b1 = (f32)s.more[0]
+    var b2 = (f32)s.more[1]
+    var hp = (f32)s.more[2]
+    for i in 0..<p.frames:
+        if struck(gate, i, &held):
+            time = 0.0
+            accent = clampf(velocity[i], 0.0, 1.0) if p.wired[1] else 0.8
+        var sum: f32 = 0.0
+        let count: usize = 2 if model == 2 else 6
+        for o in 0..<count:
+            let hz = (800.0 if o == 0 else 540.0) * tune if model == 2 else 414.0 * metal_ratios[o] * tune
+            var ph = s.damp[o] + hz * step
+            if ph >= 1.0: ph -= 1.0
+            s.damp[o] = ph
+            sum += 1.0 if ph < 0.4798 else -1.0
+        let (_, band) = simper(sum * 0.15, g_band, 0.7 if model == 2 else 1.2, &b1, &b2)
+        let tail = decay if model != 0 else decay * 0.5
+        let env = dsp.exp2(-time / clampf(tail, 0.005, 8.0) * 9.97) * (0.5 + 0.5 * accent)
+        var v = band * env
+        v = v * 4.0 if v > 0.0 else v * 0.1
+        v = v / (1.0 + absf(v))
+        hp = hp + (v - hp) * high
+        let y = v - hp if model != 2 else v
+        out[i] = y * level * 2.0
+        time += step
+    s.b = (f64)held
+    s.d = (f64)time
+    s.c = (f64)accent
+    s.more[0] = (f64)b1
+    s.more[1] = (f64)b2
+    s.more[2] = (f64)hp
+
+## The 808 clap: band-passed noise through a train of fast bursts (Number of
+## them, Rate apart, a little Random), the last one ringing out over Decay,
+## and a smooth tail beside it.
+## Inputs: gate, velocity.
+## Params: Rate (s), Number, Random, Decay (s), Tone (Hz), Tail Decay (s),
+## Tail Level, Level.
+pub func clap(s: State*, p: Ports*):
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let velocity = p.inputs[1]
+    let out = p.outputs[0]
+    let rate = clampf(p.params[0], 0.002, 0.05)
+    let number = clampf(p.params[1], 1.0, 8.0)
+    let randomness = clampf(p.params[2], 0.0, 1.0)
+    let decay = clampf(p.params[3], 0.01, 1.0)
+    let g = tan_turns(clampf(p.params[4], 300.0, 8000.0) / p.rate * 0.5)
+    let tail_decay = clampf(p.params[5], 0.01, 2.0)
+    let tail_level = p.params[6]
+    let level = p.params[7]
+    let step = 1.0 / p.rate
+    var held = (f32)s.b
+    var time = (f32)s.d
+    var accent = (f32)s.c
+    var since = (f32)s.a
+    var seed = s.seed
+    var bursts = s.heads[0]
+    var b1 = (f32)s.more[0]
+    var b2 = (f32)s.more[1]
+    var t1 = (f32)s.more[2]
+    var t2 = (f32)s.more[3]
+    var gap = (f32)s.more[4]
+    for i in 0..<p.frames:
+        if struck(gate, i, &held):
+            time = 0.0
+            since = 0.0
+            bursts = 1
+            gap = rate
+            accent = clampf(velocity[i], 0.0, 1.0) if p.wired[1] else 0.8
+        if (f32)bursts < number and since >= gap and time < 1.0:
+            bursts += 1
+            since = 0.0
+            gap = rate * (1.0 + randomness * 0.5 * dsp.white(&seed))
+        let last = (f32)bursts >= number
+        let env = dsp.exp2(-since / (decay if last else rate * 0.35) * 9.97) if bursts > 0 else 0.0
+        let tail = dsp.exp2(-time / tail_decay * 9.97) * tail_level if bursts > 0 else 0.0
+        let white = dsp.white(&seed)
+        let (_, band) = simper(white * env, g, 0.6, &b1, &b2)
+        let (_, soft) = simper(white * tail, g * 0.7, 1.4, &t1, &t2)
+        out[i] = (band * 1.4 + soft * 0.8) * (0.6 + 0.4 * accent) * level
+        time += step
+        since += step
+    s.b = (f64)held
+    s.d = (f64)time
+    s.c = (f64)accent
+    s.a = (f64)since
+    s.seed = seed
+    s.heads[0] = bursts
+    s.more[0] = (f64)b1
+    s.more[1] = (f64)b2
+    s.more[2] = (f64)t1
+    s.more[3] = (f64)t2
+    s.more[4] = (f64)gap
+
+# ---------------------------------------------------------------- Rhodes
+
+extern func c_sqrtf as "sqrtf"(x: f32) -> f32
+
+## The fundamental's T60 (s) across the keyboard, from Shear's measured Qs
+## (Eb2 949 … Eb6 1761): 78 Hz 27 s, 156 Hz 10, 311 Hz 11, 622 Hz 7.7,
+## 1245 Hz 3.1; interpolated in log frequency.
+func tine_decay(hz: f32) -> f32:
+    let points: f32[10] = [78.0, 27.0, 156.0, 10.0, 311.0, 11.0, 622.0, 7.7, 1245.0, 3.1]
+    if hz <= points[0]: return points[1]
+    var k: usize = 0
+    while k < 4:
+        let f0 = points[k * 2]
+        let f1 = points[k * 2 + 2]
+        if hz <= f1:
+            let t = (log2(hz) - log2(f0)) / (log2(f1) - log2(f0))
+            return points[k * 2 + 1] + (points[k * 2 + 3] - points[k * 2 + 1]) * t
+        k += 1
+    return 3.1 * 1245.0 / hz
+
+inline func log2(x: f32) -> f32:
+    # exponent bits plus a quartic fit on the mantissa; within 2e-4.
+    let bits = x.bits()
+    let exponent = (f32)(i32)((bits >> 23) & 255) - 127.0
+    let m = f32.bits((bits & 0x7fffff) | 0x3f800000)
+    return exponent + (-2.4967738 + (4.0283728 + (-2.0810602 + (0.62881573 - 0.079150366 * m) * m) * m) * m)
+
+## A Rhodes electric piano voice: the tine's fundamental and two quick upper
+## modes (a cantilever's, measured 7.1 and 20 times; their sum the bell),
+## struck harder with velocity, read by the electromagnetic pickup — the
+## flux of a pole near the tine's tip, 1/(1+s²)^1.5 at s = x + Symmetry, and
+## its rate of change (Faraday) — so the bark grows as the tine swings
+## further into the curve (Pfeifle; Shear; Falaize & Hélie). Then the coil's
+## low pass, a DC block and the preamp's drive.
+## Inputs: pitch, gate, velocity.
+## Params: Bell, Bell Decay (s), Hardness, Symmetry, Reach, Decay (scale),
+## Release (s), Tone (Hz), Drive (dB), Level.
+pub func tine(s: State*, p: Ports*):
+    let pitch = p.inputs[0]
+    let gate = p.inputs[1] if p.wired[1] else p.gate
+    let velocity = p.inputs[2]
+    let out = p.outputs[0]
+    let bell = p.params[0]
+    let bell_decay = clampf(p.params[1], 0.02, 4.0)
+    let hardness = clampf(p.params[2], 0.0, 1.0)
+    let symmetry = clampf(p.params[3], -1.0, 1.0)
+    let reach = clampf(p.params[4], 0.05, 3.0)
+    let decay_scale = clampf(p.params[5], 0.05, 4.0)
+    let release = clampf(p.params[6], 0.02, 4.0)
+    let tone = analog.one_pole(clampf(p.params[7], 500.0, 16000.0), p.rate)
+    let drive = decibels(p.params[8])
+    let level = p.params[9]
+    var held = (f32)s.b
+    var hz = (f32)s.a
+    let ratios: f32[3] = [1.0, 7.11, 20.25]
+    var last_flux = s.damp[6]
+    var lp = s.damp[7]
+    var dc_in = s.damp[8]
+    var dc_out = s.damp[9]
+    for i in 0..<p.frames:
+        let on = gate[i] > 0.5
+        if on and held < 0.5:
+            # The first strike: the pickup's flux starts where the tine rests.
+            if hz == 0.0:
+                let rest = 1.0 + symmetry * symmetry
+                last_flux = 1.0 / (rest * c_sqrtf(rest))
+            # A new strike: the modes ring from here, added to what rings.
+            hz = 261.62558 * exp2(pitch[i] if p.wired[0] else 0.0)
+            let v = clampf(velocity[i], 0.0, 1.0) if p.wired[2] else 0.7
+            let swing = (0.05 + 0.95 * v * v) * reach
+            let strike = bell * (0.3 + 0.7 * hardness) * v
+            let amplitudes: f32[3] = [swing, swing * strike * 0.5, swing * strike * 0.25]
+            for m in 0..<3:
+                let w = clampf(hz * ratios[m] / p.rate, 0.0, 0.45)
+                # y[n] = A sin(w n): the previous two samples of a fresh sine.
+                s.damp[m * 2] = s.damp[m * 2] + amplitudes[m] * dsp.sin_turns(w)
+        held = 1.0 if on else 0.0
+        var x: f32 = 0.0
+        for m in 0..<3:
+            let w = clampf(hz * ratios[m] / p.rate, 0.0, 0.45)
+            var t60 = tine_decay(hz) * decay_scale if m == 0 else (bell_decay if m == 1 else 0.05)
+            if not on and t60 > release: t60 = release
+            let r = exp2(-9.966 / (t60 * p.rate))
+            let c = 2.0 * r * dsp.sin_turns(w + 0.25)
+            let y1 = s.damp[m * 2]
+            let y2 = s.damp[m * 2 + 1]
+            let y = c * y1 - r * r * y2
+            s.damp[m * 2 + 1] = y1
+            s.damp[m * 2] = y
+            x += y
+        # The pickup: flux falls off with distance; its change is the voltage.
+        let d = x + symmetry
+        let t = 1.0 + d * d
+        let flux = 1.0 / (t * c_sqrtf(t))
+        var volts = (flux - last_flux) / (6.2831855 * clampf(hz / p.rate, 0.0002, 0.45))
+        last_flux = flux
+        # Never struck yet: the pickup sees a resting tine.
+        if hz == 0.0: volts = 0.0
+        lp = lp + (volts - lp) * tone
+        volts = analog.dc_block(lp, &dc_in, &dc_out, 0.999)
+        let shaped = analog.tanh(volts * drive) / analog.tanh(clampf(drive, 1.0, 4.0)) if drive > 1.0 else volts
+        out[i] = shaped * level * 0.5
+    s.b = (f64)held
+    s.a = (f64)hz
+    s.damp[6] = last_flux
+    s.damp[7] = lp
+    s.damp[8] = dc_in
+    s.damp[9] = dc_out
+
+## The line memory (samples) a voice of `kind` needs at `rate`.
+pub func memory(kind: u32, rate: f64) -> usize:
+    return effects.memory_of(kind, rate)
+
+# ---------------------------------------------------------------- diode ladder
+
+## The TB-303 core's poles, in units of the cutoff (Stinchcombe's transfer
+## function -1/(s⁴ + 6.727s³ + 14.142s² + 9.514s + 1)): unevenly spread,
+## the diode ladder's signature; the EMS VCS3's, -3/(s⁴ + 8.335s³ + ...).
+let tb303_poles: f32[4] = [3.24, 2.33, 1.04, 0.13]
+let vcs3_poles: f32[4] = [4.70, 2.43, 1.03, 0.18]
+
+## A diode ladder (TB-303, EMS VCS3): four TPT one-poles at the diode
+## ladder's uneven pole spacing, the loop solved without delay through a
+## tanh at the feedback node, a high pass in the feedback path (Open303)
+## so resonance thins the lows as the 303 does; at twice the rate.
+## Inputs: in, cutoff (octaves), resonance (added).
+## Params: Cutoff, Resonance, Drive (dB), Core (303 | VCS3), Feedback HP (Hz), Slop.
+pub func diode_ladder(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let reson = p.inputs[2]
+    let out = p.outputs[0]
+    let cutoff = p.params[0] * exp2(s.variation * p.params[5] * 0.07)
+    let drive = decibels(p.params[2])
+    let vcs3 = p.params[3] > 0.5
+    let rate = p.rate * 2.0
+    let top = p.rate * 0.45
+    let feedback_hp = analog.one_pole(clampf(p.params[4], 5.0, 1000.0), rate)
+    var z: f32[4]
+    for k in 0..<4: z[k] = (f32)s.more[k]
+    var z_hp = (f32)s.more[4]
+    let up = analog.band(s.bands, 0)
+    let down = analog.band(s.bands, 1)
+    var gains: f32[4]
+    var fc = cutoff
+    var resonance = p.params[1]
+    var seed = s.seed
+    for i in 0..<p.frames:
+        if i == 0 or p.wired[1]:
+            if p.wired[1]: fc = cutoff * exp2(moves[i])
+            for k in 0..<4:
+                let pole = vcs3_poles[k] if vcs3 else tb303_poles[k]
+                # Scaled so the loop's phase reaches 180° at the cutoff: it
+                # self-oscillates there (0.8385 for the 303, 0.7422 the VCS3).
+                let g = tan_turns(clampf(fc * pole * (0.7422 if vcs3 else 0.8385), 5.0, top) / rate * 0.5)
+                gains[k] = g / (1.0 + g)
+        if p.wired[2]: resonance = p.params[1] + reson[i]
+        # Self-oscillation at k = 16.8 (303) or 14.8 (VCS3) for these poles
+        # (Zavalishin: a diode ladder needs about 16-17), so 1 is the edge.
+        let k_loop = clampf(resonance, 0.0, 1.3) * (14.79 if vcs3 else 16.81)
+        let total = gains[0] * gains[1] * gains[2] * gains[3]
+        let (x0, x1) = analog.upsample(up, source[i] * drive + dsp.white(&seed) * 0.00001)
+        var pair: f32[2]
+        var half: usize = 0
+        while half < 2:
+            let x = x0 if half == 0 else x1
+            # The chain's response to its states alone: y4 = total u + S.
+            var sum = (1.0 - gains[0]) * z[0]
+            sum = gains[1] * sum + (1.0 - gains[1]) * z[1]
+            sum = gains[2] * sum + (1.0 - gains[2]) * z[2]
+            sum = gains[3] * sum + (1.0 - gains[3]) * z[3]
+            let u = analog.tanh((x - k_loop * (sum - z_hp)) / (1.0 + k_loop * total))
+            var y = u
+            for k in 0..<4:
+                y = one_pole_step(y, gains[k], &z[k])
+            # The feedback path's high pass follows the output.
+            z_hp = z_hp + (y - z_hp) * feedback_hp
+            pair[half] = y
+            half += 1
+        out[i] = analog.downsample(down, pair[0], pair[1]) * 3.0 * (1.0 + 0.5 * clampf(resonance, 0.0, 1.0)) / (0.5 + 0.5 * drive)
+    for k in 0..<4: s.more[k] = (f64)z[k]
+    s.more[4] = (f64)z_hp
+    s.seed = seed

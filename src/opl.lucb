@@ -1,0 +1,1092 @@
+# Ported to Luce Base from fmopl.c; the original header follows.
+#
+# /*
+# **
+# ** File: fmopl.c - software implementation of FM sound generator
+# **                                            types OPL and OPL2
+# **
+# ** Copyright (C) 2002,2003 Jarek Burczynski (bujar at mame dot net)
+# ** Copyright (C) 1999,2000 Tatsuyuki Satoh , MultiArcadeMachineEmulator development
+# **
+# ** Version 0.720003 ;D
+# **
+#
+# Revision History:
+#
+# 06-05-2004 Ripper:
+#  - Added mute support
+#
+# 04-30-2004 Ripper:
+#  - Raised the main volume (may cut some quality, but at least you can hear it ;)
+#
+# 02-20-2004 Ripper:
+#  - Changed YM3812Write to do what we want
+#
+# 04-08-2003 Jarek Burczynski:
+#  - removed BFRDY hack. BFRDY is busy flag, and it should be 0 only when the chip
+#    handles memory read/write or during the adpcm synthesis when the chip
+#    requests another byte of ADPCM data.
+#
+# 24-07-2003 Jarek Burczynski:
+#  - added a small hack for Y8950 status BFRDY flag (bit 3 should be set after
+#    some (unknown) delay). Right now it's always set.
+#
+# 14-06-2003 Jarek Burczynski:
+#  - implemented all of the status register flags in Y8950 emulation
+#  - renamed Y8950SetDeltaTMemory() parameters from _rom_ to _mem_ since
+#    they can be either RAM or ROM
+#
+# 08-10-2002 Jarek Burczynski (thanks to Dox for the YM3526 chip)
+#  - corrected YM3526Read() to always set bit 2 and bit 1
+#    to HIGH state - identical to YM3812Read (verified on real YM3526)
+#
+# 04-28-2002 Jarek Burczynski:
+#  - binary exact Envelope Generator (verified on real YM3812);
+#    compared to YM2151: the EG clock is equal to internal_clock,
+#    rates are 2 times slower and volume resolution is one bit less
+#  - modified interface functions (they no longer return pointer -
+#    that's internal to the emulator now):
+#     - new wrapper functions for OPLCreate: YM3526Init(), YM3812Init() and Y8950Init()
+#  - corrected 'off by one' error in feedback calculations (when feedback is off)
+#  - enabled waveform usage (credit goes to Vlad Romascanu and zazzal22)
+#  - speeded up noise generator calculations (Nicola Salmoria)
+#
+# 03-24-2002 Jarek Burczynski (thanks to Dox for the YM3812 chip)
+#  Complete rewrite (all verified on real YM3812):
+#  - corrected sin_tab and tl_tab data
+#  - corrected operator output calculations
+#  - corrected waveform_select_enable register;
+#    simply: ignore all writes to waveform_select register when
+#    waveform_select_enable == 0 and do not change the waveform previously selected.
+#  - corrected KSR handling
+#  - corrected Envelope Generator: attack shape, Sustain mode and
+#    Percussive/Non-percussive modes handling
+#  - Envelope Generator rates are two times slower now
+#  - LFO amplitude (tremolo) and phase modulation (vibrato)
+#  - rhythm sounds phase generation
+#  - white noise generator (big thanks to Olivier Galibert for mentioning Berlekamp-Massey algorithm)
+#  - corrected key on/off handling (the 'key' signal is ORed from three sources: FM, rhythm and CSM)
+#  - funky details (like ignoring output of operator 1 in BD rhythm sound when connect == 1)
+#
+# 12-28-2001 Acho A. Tang
+#  - reflected Delta-T EOS status on Y8950 status port.
+#  - fixed subscription range of attack/decay tables
+#
+#
+# 	To do:
+# 		add delay before key off in CSM mode (see CSMKeyControll)
+# 		verify volume of the FM part on the Y8950
+# */
+#
+# Ported to Luce Base from Wolf4SDL's copy of MAME's fmopl.c (the
+# non-GPL branch), keeping only the YM3812 (OPL2) path that IMF music
+# needs: table setup, reset, register writes and mono sample output.
+# Y8950/ADPCM, YM3526, timers, IRQ and port handlers, CSM, status reads,
+# mute, SAVE_SAMPLE and LOG_CYM_FILE are gone. The integer arithmetic,
+# the tables and the order of every step are the original's, so the
+# samples are bit-for-bit those of the C core.
+
+## A YM3812 (OPL2) FM chip, for rendering AdLib music. Make one with
+## `new Opl` (it must start zeroed), `start` it at a sample rate, then
+## `write` registers and `render` samples between writes.
+from luce_std import math
+
+let freq_sh: u32 = 16           # 16.16 fixed point (frequency calculations)
+let eg_sh: u32 = 16             # 16.16 fixed point (EG timing)
+let lfo_sh: u32 = 24            #  8.24 fixed point (LFO calculations)
+let freq_mask: u32 = 0xffff
+
+# envelope output entries
+let env_bits: u32 = 10
+let env_step: f64 = 0.125       # 128.0 / ENV_LEN
+let max_att_index: i32 = 511
+let min_att_index: i32 = 0
+
+# sinwave entries
+let sin_bits: u32 = 10
+let sin_len: u32 = 1024
+let sin_mask: u32 = 1023
+
+let tl_res_len: u32 = 256       # 8 bits addressing (real chip)
+# 12 - sinus amplitude bits (Y axis), 2 - sinus sign bit (Y axis), TL_RES_LEN - sinus resolution (X axis)
+let tl_tab_len: u32 = 6144      # 12 * 2 * TL_RES_LEN
+let env_quiet: u32 = 384        # TL_TAB_LEN >> 4
+
+let rate_steps: u32 = 8
+let lfo_am_tab_elements: u32 = 210
+
+# Envelope Generator phases
+let eg_att: u32 = 4
+let eg_dec: u32 = 3
+let eg_sus: u32 = 2
+let eg_rel: u32 = 1
+let eg_off: u32 = 0
+
+## The chip clock of an AdLib card, Hz.
+pub let adlib_clock: i32 = 3579545
+
+# mapping of register number (offset) to slot number used by the emulator
+let slot_array: i32[32] = [
+    0, 2, 4, 1, 3, 5, -1, -1,
+    6, 8, 10, 7, 9, 11, -1, -1,
+    12, 14, 16, 13, 15, 17, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1
+]
+
+# key scale level
+# table is 3dB/octave, DV converts this into 6dB/octave
+# 0.1875 is bit 0 weight of the envelope counter (volume) expressed in the 'decibel' scale
+# DV(db) = (UINT32)(db / (0.1875 / 2.0)): every entry below is exact
+let ksl_tab: u32[128] = [
+    # OCT 0
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # OCT 1: 0.000 ... 0.750, 1.125, 1.500, 1.875, 2.250, 2.625, 3.000 dB
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 12, 16, 20, 24, 28, 32,
+    # OCT 2
+    0, 0, 0, 0, 0, 12, 20, 28, 32, 40, 44, 48, 52, 56, 60, 64,
+    # OCT 3
+    0, 0, 0, 20, 32, 44, 52, 60, 64, 72, 76, 80, 84, 88, 92, 96,
+    # OCT 4
+    0, 0, 32, 52, 64, 76, 84, 92, 96, 104, 108, 112, 116, 120, 124, 128,
+    # OCT 5
+    0, 32, 64, 84, 96, 108, 116, 124, 128, 136, 140, 144, 148, 152, 156, 160,
+    # OCT 6
+    0, 64, 96, 116, 128, 140, 148, 156, 160, 168, 172, 176, 180, 184, 188, 192,
+    # OCT 7: 0.000, 9.000, 12.000 ... 21.000 dB
+    0, 96, 128, 148, 160, 172, 180, 188, 192, 200, 204, 208, 212, 216, 220, 224
+]
+
+# sustain level table (3dB per step)
+# 0 - 15: 0, 3, 6, 9,12,15,18,21,24,27,30,33,36,39,42,93 (dB)
+# SC(db) = (UINT32)(db * (2.0 / ENV_STEP)) of 0..14 and 31
+let sl_tab: u32[16] = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 496]
+
+let eg_inc: u32[120] = [
+    # cycle:0 1  2 3  4 5  6 7
+    0, 1, 0, 1, 0, 1, 0, 1,     #  0: rates 00..12 0 (increment by 0 or 1)
+    0, 1, 0, 1, 1, 1, 0, 1,     #  1: rates 00..12 1
+    0, 1, 1, 1, 0, 1, 1, 1,     #  2: rates 00..12 2
+    0, 1, 1, 1, 1, 1, 1, 1,     #  3: rates 00..12 3
+    1, 1, 1, 1, 1, 1, 1, 1,     #  4: rate 13 0 (increment by 1)
+    1, 1, 1, 2, 1, 1, 1, 2,     #  5: rate 13 1
+    1, 2, 1, 2, 1, 2, 1, 2,     #  6: rate 13 2
+    1, 2, 2, 2, 1, 2, 2, 2,     #  7: rate 13 3
+    2, 2, 2, 2, 2, 2, 2, 2,     #  8: rate 14 0 (increment by 2)
+    2, 2, 2, 4, 2, 2, 2, 4,     #  9: rate 14 1
+    2, 4, 2, 4, 2, 4, 2, 4,     # 10: rate 14 2
+    2, 4, 4, 4, 2, 4, 4, 4,     # 11: rate 14 3
+    4, 4, 4, 4, 4, 4, 4, 4,     # 12: rates 15 0, 15 1, 15 2, 15 3 (increment by 4)
+    8, 8, 8, 8, 8, 8, 8, 8,     # 13: rates 15 2, 15 3 for attack
+    0, 0, 0, 0, 0, 0, 0, 0      # 14: infinity rates for attack and decay(s)
+]
+
+# Envelope Generator rates (16 + 64 rates + 16 RKS), O(a) = a * RATE_STEPS;
+# note that there is no O(13) in this table - it's directly in the code
+let eg_rate_select: u32[96] = [
+    # 16 infinite time rates: O(14)
+    112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112, 112,
+    # rates 00-12: O(0), O(1), O(2), O(3)
+    0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24,
+    0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24,
+    0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24, 0, 8, 16, 24,
+    0, 8, 16, 24,
+    # rate 13: O(4..7)
+    32, 40, 48, 56,
+    # rate 14: O(8..11)
+    64, 72, 80, 88,
+    # rate 15: O(12)
+    96, 96, 96, 96,
+    # 16 dummy rates (same as 15 3)
+    96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96, 96
+]
+
+# rate  0,    1,    2,    3,   4,   5,   6,  7,  8,  9,  10, 11, 12, 13, 14, 15
+# shift 12,   11,   10,   9,   8,   7,   6,  5,  4,  3,  2,  1,  0,  0,  0,  0
+# mask  4095, 2047, 1023, 511, 255, 127, 63, 31, 15, 7,  3,  1,  0,  0,  0,  0
+let eg_rate_shift: u32[96] = [
+    # 16 infinite time rates
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # rates 00-12
+    12, 12, 12, 12, 11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9,
+    8, 8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5,
+    4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1,
+    0, 0, 0, 0,
+    # rates 13, 14, 15
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    # 16 dummy rates (same as 15 3)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+]
+
+# multiple table, ML(a) = a * 2 of 1/2, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,10,12,12,15,15
+let mul_tab: u32[16] = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30]
+
+# LFO Amplitude Modulation table (verified on real YM3812)
+# 27 output levels (triangle waveform); 1 level takes one of: 192, 256 or 448 samples
+#
+# Length: 210 elements.
+#
+# Each of the elements has to be repeated exactly 64 times (on 64 consecutive
+# samples). The whole table takes: 64 * 210 = 13440 samples.
+#
+# When AM = 1 data is used directly
+# When AM = 0 data is divided by 4 before being used (loosing precision is important)
+let lfo_am_table: u32[210] = [
+    0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+    5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8,
+    9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12,
+    13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16,
+    17, 17, 17, 17, 18, 18, 18, 18, 19, 19, 19, 19, 20, 20, 20, 20,
+    21, 21, 21, 21, 22, 22, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24,
+    25, 25, 25, 25,
+    26, 26, 26,
+    25, 25, 25, 25,
+    24, 24, 24, 24, 23, 23, 23, 23, 22, 22, 22, 22, 21, 21, 21, 21,
+    20, 20, 20, 20, 19, 19, 19, 19, 18, 18, 18, 18, 17, 17, 17, 17,
+    16, 16, 16, 16, 15, 15, 15, 15, 14, 14, 14, 14, 13, 13, 13, 13,
+    12, 12, 12, 12, 11, 11, 11, 11, 10, 10, 10, 10, 9, 9, 9, 9,
+    8, 8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5,
+    4, 4, 4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1
+]
+
+# LFO Phase Modulation table (verified on real YM3812)
+let lfo_pm_table: i32[128] = [
+    # FNUM2/FNUM = 00 0xxxxxxx (0x0000)
+    0, 0, 0, 0, 0, 0, 0, 0,             # LFO PM depth = 0
+    0, 0, 0, 0, 0, 0, 0, 0,             # LFO PM depth = 1
+    # FNUM2/FNUM = 00 1xxxxxxx (0x0080)
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 0, -1, 0, 0, 0,
+    # FNUM2/FNUM = 01 0xxxxxxx (0x0100)
+    1, 0, 0, 0, -1, 0, 0, 0,
+    2, 1, 0, -1, -2, -1, 0, 1,
+    # FNUM2/FNUM = 01 1xxxxxxx (0x0180)
+    1, 0, 0, 0, -1, 0, 0, 0,
+    3, 1, 0, -1, -3, -1, 0, 1,
+    # FNUM2/FNUM = 10 0xxxxxxx (0x0200)
+    2, 1, 0, -1, -2, -1, 0, 1,
+    4, 2, 0, -2, -4, -2, 0, 2,
+    # FNUM2/FNUM = 10 1xxxxxxx (0x0280)
+    2, 1, 0, -1, -2, -1, 0, 1,
+    5, 2, 0, -2, -5, -2, 0, 2,
+    # FNUM2/FNUM = 11 0xxxxxxx (0x0300)
+    3, 1, 0, -1, -3, -1, 0, 1,
+    6, 3, 0, -3, -6, -3, 0, 3,
+    # FNUM2/FNUM = 11 1xxxxxxx (0x0380)
+    3, 1, 0, -1, -3, -1, 0, 1,
+    7, 3, 0, -3, -7, -3, 0, 3
+]
+
+## One operator (OPL_SLOT).
+struct Slot:
+    var ar: u32             # attack rate: AR<<2
+    var dr: u32             # decay rate:  DR<<2
+    var rr: u32             # release rate:RR<<2
+    var ksr_shift: u32      # KSR: key scale rate
+    var ksl: u32            # keyscale level
+    var ksr: u32            # key scale rate: kcode>>KSR
+    var mul: u32            # multiple: mul_tab[ML]
+
+    # Phase Generator
+    var cnt: u32            # frequency counter
+    var incr: u32           # frequency counter step
+    var fb: u32             # feedback shift value
+    var op1_out: i32[2]     # slot1 output for feedback
+    var con: u32            # connection (algorithm) type: slot1 into output, else into phase_modulation
+
+    # Envelope Generator
+    var eg_type: u32        # percussive/non-percussive mode
+    var state: u32          # phase type
+    var tl: u32             # total level: TL << 2
+    var tll: u32            # adjusted now TL
+    var volume: i32         # envelope counter
+    var sl: u32             # sustain level: sl_tab[SL]
+    var eg_sh_ar: u32       # (attack state)
+    var eg_sel_ar: u32      # (attack state)
+    var eg_sh_dr: u32       # (decay state)
+    var eg_sel_dr: u32      # (decay state)
+    var eg_sh_rr: u32       # (release state)
+    var eg_sel_rr: u32      # (release state)
+    var key: u32            # 0 = KEY OFF, >0 = KEY ON
+
+    # LFO
+    var am_mask: u32        # LFO Amplitude Modulation enable mask
+    var vib: u32            # LFO Phase Modulation enable flag (active high)
+
+    # waveform select
+    var wavetable: u32
+
+## One channel (OPL_CH).
+struct Channel:
+    var slots: Slot[2]
+    # phase generator state
+    var block_fnum: u32     # block+fnum
+    var fc: u32             # Freq. Increment base
+    var ksl_base: u32       # KeyScaleLevel Base step
+    var kcode: u32          # key code (for key scaling)
+
+## The chip (FM_OPL), its generated tables, and what fmopl.c kept in
+## file-scope statics.
+pub struct Opl:
+    var channels: Channel[9]        # OPL/OPL2 chips have 9 channels
+
+    var eg_cnt: u32                 # global envelope generator counter
+    var eg_timer: u32               # global envelope generator counter works at frequency = chipclock/72
+    var eg_timer_add: u32           # step of eg_timer
+    var eg_timer_overflow: u32      # envelope generator timer overlfows every 1 sample (on real chip)
+
+    var rhythm: u32                 # Rhythm mode
+
+    var fn_tab: u32[1024]           # fnumber->increment counter
+
+    # LFO
+    var lfo_am_depth: u32
+    var lfo_pm_depth_range: u32
+    var lfo_am_cnt: u32
+    var lfo_am_inc: u32
+    var lfo_pm_cnt: u32
+    var lfo_pm_inc: u32
+
+    var noise_rng: u32              # 23 bit noise shift register
+    var noise_p: u32                # current noise 'phase'
+    var noise_f: u32                # current noise period
+
+    var wavesel: u32                # waveform select enable flag
+    var mode: u32                   # Reg.08 : CSM,notesel,etc.
+
+    var lfo_am: u32                 # LFO_AM
+    var lfo_pm: u32                 # LFO_PM
+    var phase_modulation: i32       # phase modulation input (SLOT 2)
+    var output: i32
+
+    var tl_tab: i32[6144]           # TL_TAB_LEN
+    var sin_tab: u32[4096]          # sin waveform table in 'decibel' scale; four waveforms on OPL2 type chips
+
+    ## Set a zeroed chip up at `clock` Hz, rendering `rate` samples a
+    ## second, and reset it (init_tables, OPL_initalize, OPLResetChip).
+    pub func start(clock: i32, rate: i32):
+        init_tables(&self)
+        initialize(&self, clock, rate)
+        reset_chip(&self)
+
+    ## Write `value` to register `reg` (OPLWriteReg).
+    pub func write(reg: i32, value: i32):
+        write_reg(&self, (u32)reg & 0xff, (u32)value & 0xff)
+
+    ## Fill `pcm` with signed 16-bit little-endian mono samples
+    ## (YM3812UpdateOne, one channel of its stereo pair).
+    pub func render(pcm: u8[]):
+        update(&self, pcm)
+
+# generic table initialize
+func init_tables(chip: Opl*):
+    for x: u32 in 0..<tl_res_len:
+        var m = (f64)(1 << 16) / math.pow(2.0, (f64)(x + 1) * (env_step / 4.0) / 8.0)
+        m = math.floor(m)
+
+        # we never reach (1<<16) here due to the (x+1)
+        # result fits within 16 bits at maximum
+
+        var n = (i32)m          # 16 bits here
+        n >>= 4                 # 12 bits here
+        if (n & 1) != 0:        # round to nearest
+            n = (n >> 1) + 1
+        else:
+            n = n >> 1
+                                # 11 bits here (rounded)
+        n <<= 1                 # 12 bits here (as in real chip)
+        chip.tl_tab[x * 2 + 0] = n
+        chip.tl_tab[x * 2 + 1] = -chip.tl_tab[x * 2 + 0]
+
+        for i: u32 in 1..<12:
+            chip.tl_tab[x * 2 + 0 + i * 2 * tl_res_len] = chip.tl_tab[x * 2 + 0] >> i
+            chip.tl_tab[x * 2 + 1 + i * 2 * tl_res_len] = -chip.tl_tab[x * 2 + 0 + i * 2 * tl_res_len]
+
+    for i: u32 in 0..<sin_len:
+        # non-standard sinus
+        let m = math.sin((f64)(i * 2 + 1) * math.pi / (f64)sin_len)   # checked against the real chip
+
+        # we never reach zero here due to ((i*2)+1)
+
+        var o: f64
+        if m > 0.0:
+            o = 8.0 * math.log(1.0 / m) / math.log(2.0)    # convert to 'decibels'
+        else:
+            o = 8.0 * math.log(-1.0 / m) / math.log(2.0)   # convert to 'decibels'
+
+        o = o / (env_step / 4.0)
+
+        var n = (i32)(2.0 * o)
+        if (n & 1) != 0:        # round to nearest
+            n = (n >> 1) + 1
+        else:
+            n = n >> 1
+
+        chip.sin_tab[i] = (u32)(n * 2 + (0 if m >= 0.0 else 1))
+
+    for i: u32 in 0..<sin_len:
+        # waveform 1:  __      __
+        #             /  \____/  \____
+        # output only first half of the sinus waveform (positive one)
+        if (i & (1 << (sin_bits - 1))) != 0:
+            chip.sin_tab[1 * sin_len + i] = tl_tab_len
+        else:
+            chip.sin_tab[1 * sin_len + i] = chip.sin_tab[i]
+
+        # waveform 2:  __  __  __  __
+        #             /  \/  \/  \/  \
+        # abs(sin)
+        chip.sin_tab[2 * sin_len + i] = chip.sin_tab[i & (sin_mask >> 1)]
+
+        # waveform 3:  _   _   _   _
+        #             / |_/ |_/ |_/ |_
+        # abs(output only first quarter of the sinus waveform)
+        if (i & (1 << (sin_bits - 2))) != 0:
+            chip.sin_tab[3 * sin_len + i] = tl_tab_len
+        else:
+            chip.sin_tab[3 * sin_len + i] = chip.sin_tab[i & (sin_mask >> 2)]
+
+func initialize(chip: Opl*, clock: i32, rate: i32):
+    # frequency base
+    let freqbase = ((f64)clock / 72.0) / (f64)rate if rate != 0 else 0.0
+
+    # make fnumber -> increment counter table
+    for i: u32 in 0..<1024:
+        # opn phase increment counter = 20bit
+        # -10 because chip works with 10.10 fixed point, while we use 16.16
+        chip.fn_tab[i] = (u32)((f64)i * 64.0 * freqbase * (f64)(1 << (freq_sh - 10)))
+
+    # Amplitude modulation: 27 output levels (triangle waveform); 1 level takes one of: 192, 256 or 448 samples
+    # One entry from LFO_AM_TABLE lasts for 64 samples
+    chip.lfo_am_inc = (u32)((1.0 / 64.0) * (f64)(1 << lfo_sh) * freqbase)
+
+    # Vibrato: 8 output levels (triangle waveform); 1 level takes 1024 samples
+    chip.lfo_pm_inc = (u32)((1.0 / 1024.0) * (f64)(1 << lfo_sh) * freqbase)
+
+    # Noise generator: a step takes 1 sample
+    chip.noise_f = (u32)((1.0 / 1.0) * (f64)(1 << freq_sh) * freqbase)
+
+    chip.eg_timer_add = (u32)((f64)(1 << eg_sh) * freqbase)
+    chip.eg_timer_overflow = 1 * (1 << eg_sh)
+
+func reset_chip(chip: Opl*):
+    chip.eg_timer = 0
+    chip.eg_cnt = 0
+
+    chip.noise_rng = 1      # noise shift register
+    chip.mode = 0           # normal mode
+
+    # reset with register write
+    write_reg(chip, 0x01, 0)    # wavesel disable
+    write_reg(chip, 0x02, 0)    # Timer1
+    write_reg(chip, 0x03, 0)    # Timer2
+    write_reg(chip, 0x04, 0)    # IRQ mask clear
+    var r: u32 = 0xff
+    while r >= 0x20:
+        write_reg(chip, r, 0)
+        r -= 1
+
+    # reset operator parameters
+    for c: usize in 0..<9:
+        for s: usize in 0..<2:
+            let slot: Slot* = &chip.channels[c].slots[s]
+            slot.wavetable = 0      # wave table
+            slot.state = eg_off
+            slot.volume = max_att_index
+
+# advance LFO to next sample
+inline func advance_lfo(chip: Opl*):
+    # LFO
+    chip.lfo_am_cnt +%= chip.lfo_am_inc
+    if chip.lfo_am_cnt >= (lfo_am_tab_elements << lfo_sh):     # lfo_am_table is 210 elements long
+        chip.lfo_am_cnt -= (lfo_am_tab_elements << lfo_sh)
+
+    let tmp = lfo_am_table[chip.lfo_am_cnt >> lfo_sh]
+
+    if chip.lfo_am_depth != 0:
+        chip.lfo_am = tmp
+    else:
+        chip.lfo_am = tmp >> 2
+
+    chip.lfo_pm_cnt +%= chip.lfo_pm_inc
+    chip.lfo_pm = ((chip.lfo_pm_cnt >> lfo_sh) & 7) | chip.lfo_pm_depth_range
+
+# advance to next sample
+inline func advance(chip: Opl*):
+    chip.eg_timer +%= chip.eg_timer_add
+
+    while chip.eg_timer >= chip.eg_timer_overflow:
+        chip.eg_timer -= chip.eg_timer_overflow
+
+        chip.eg_cnt +%= 1
+
+        for i: usize in 0..<18:
+            let op: Slot* = &chip.channels[i // 2].slots[i & 1]
+
+            # Envelope Generator
+            if op.state == eg_att:          # attack phase
+                if (chip.eg_cnt & ((1 << op.eg_sh_ar) - 1)) == 0:
+                    op.volume += (~op.volume * (i32)eg_inc[op.eg_sel_ar + ((chip.eg_cnt >> op.eg_sh_ar) & 7)]) >> 3
+
+                    if op.volume <= min_att_index:
+                        op.volume = min_att_index
+                        op.state = eg_dec
+            elif op.state == eg_dec:        # decay phase
+                if (chip.eg_cnt & ((1 << op.eg_sh_dr) - 1)) == 0:
+                    op.volume += (i32)eg_inc[op.eg_sel_dr + ((chip.eg_cnt >> op.eg_sh_dr) & 7)]
+
+                    if (u32)op.volume >= op.sl:
+                        op.state = eg_sus
+            elif op.state == eg_sus:        # sustain phase
+                # this is important behaviour:
+                # one can change percusive/non-percussive modes on the fly and
+                # the chip will remain in sustain phase - verified on real YM3812
+                if op.eg_type == 0:         # percussive mode (non-percussive does nothing)
+                    # during sustain phase chip adds Release Rate (in percussive mode)
+                    if (chip.eg_cnt & ((1 << op.eg_sh_rr) - 1)) == 0:
+                        op.volume += (i32)eg_inc[op.eg_sel_rr + ((chip.eg_cnt >> op.eg_sh_rr) & 7)]
+
+                        if op.volume >= max_att_index:
+                            op.volume = max_att_index
+                    # else do nothing in sustain phase
+            elif op.state == eg_rel:        # release phase
+                if (chip.eg_cnt & ((1 << op.eg_sh_rr) - 1)) == 0:
+                    op.volume += (i32)eg_inc[op.eg_sel_rr + ((chip.eg_cnt >> op.eg_sh_rr) & 7)]
+
+                    if op.volume >= max_att_index:
+                        op.volume = max_att_index
+                        op.state = eg_off
+
+    for i: usize in 0..<18:
+        let ch: Channel* = &chip.channels[i // 2]
+        let op: Slot* = &ch.slots[i & 1]
+
+        # Phase Generator
+        if op.vib != 0:
+            var block_fnum = ch.block_fnum
+            let fnum_lfo = (block_fnum & 0x0380) >> 7
+            let lfo_fn_table_index_offset = lfo_pm_table[chip.lfo_pm + 16 * fnum_lfo]
+
+            if lfo_fn_table_index_offset != 0:      # LFO phase modulation active
+                block_fnum +%= (u32)lfo_fn_table_index_offset
+                let block = (block_fnum & 0x1c00) >> 10
+                op.cnt +%= (chip.fn_tab[block_fnum & 0x03ff] >> (7 - block)) *% op.mul
+            else:                                   # LFO phase modulation = zero
+                op.cnt +%= op.incr
+        else:                                       # LFO phase modulation disabled for this operator
+            op.cnt +%= op.incr
+
+    # The Noise Generator of the YM3812 is 23-bit shift register.
+    # Period is equal to 2^23-2 samples.
+    # Register works at sampling frequency of the chip, so output
+    # can change on every sample.
+    #
+    # Output of the register and input to the bit 22 is:
+    # bit0 XOR bit14 XOR bit15 XOR bit22
+    #
+    # Simply use bit 22 as the noise output.
+
+    chip.noise_p +%= chip.noise_f
+    var shifts = chip.noise_p >> freq_sh        # number of events (shifts of the shift register)
+    chip.noise_p &= freq_mask
+    while shifts != 0:
+        # Instead of doing all the logic operations above, we
+        # use a trick here (and use bit 0 as the noise output).
+        # The difference is only that the noise bit changes one
+        # step ahead. This doesn't matter since we don't know
+        # what is real state of the noise_rng after the reset.
+        if (chip.noise_rng & 1) != 0:
+            chip.noise_rng ^= 0x800302
+        chip.noise_rng >>= 1
+
+        shifts -= 1
+
+# op_calc and op_calc1: `pm` enters the phase above its 16 fraction bits in
+# op_calc and as is in op_calc1. The C adds in UINT32, casts to signed int and
+# shifts right arithmetically before masking 10 bits; the mask keeps bits
+# 16..25 of the sum alone, so the unsigned shift here selects the same ones.
+inline func op_calc(chip: Opl*, phase: u32, env: u32, pm: i32, wave_tab: u32) -> i32:
+    let p = (env << 4) + chip.sin_tab[wave_tab + ((((phase & ~freq_mask) +% ((u32)pm << 16)) >> freq_sh) & sin_mask)]
+
+    if p >= tl_tab_len:
+        return 0
+    return chip.tl_tab[p]
+
+inline func op_calc1(chip: Opl*, phase: u32, env: u32, pm: i32, wave_tab: u32) -> i32:
+    let p = (env << 4) + chip.sin_tab[wave_tab + ((((phase & ~freq_mask) +% (u32)pm) >> freq_sh) & sin_mask)]
+
+    if p >= tl_tab_len:
+        return 0
+    return chip.tl_tab[p]
+
+inline func volume_calc(chip: Opl*, op: const Slot*) -> u32:
+    return op.tll +% (u32)op.volume +% (chip.lfo_am & op.am_mask)
+
+# calculate output
+inline func calc_channel(chip: Opl*, ch: Channel*):
+    chip.phase_modulation = 0
+
+    # SLOT 1
+    let slot1: Slot* = &ch.slots[0]
+    var env = volume_calc(chip, slot1)
+    var feedback = slot1.op1_out[0] + slot1.op1_out[1]
+    slot1.op1_out[0] = slot1.op1_out[1]
+    if slot1.con != 0:
+        chip.output += slot1.op1_out[0]
+    else:
+        chip.phase_modulation += slot1.op1_out[0]
+    slot1.op1_out[1] = 0
+    if env < env_quiet:
+        if slot1.fb == 0:
+            feedback = 0
+        slot1.op1_out[1] = op_calc1(chip, slot1.cnt, env, feedback << slot1.fb, slot1.wavetable)
+
+    # SLOT 2
+    let slot2: Slot* = &ch.slots[1]
+    env = volume_calc(chip, slot2)
+    if env < env_quiet:
+        chip.output += op_calc(chip, slot2.cnt, env, chip.phase_modulation, slot2.wavetable)
+
+# operators used in the rhythm sounds generation process:
+#
+# Envelope Generator:
+#
+# channel  operator  register number   Bass  High  Snare Tom  Top
+# / slot   number    TL ARDR SLRR Wave Drum  Hat   Drum  Tom  Cymbal
+#  6 / 0   12        50  70   90   f0  +
+#  6 / 1   15        53  73   93   f3  +
+#  7 / 0   13        51  71   91   f1        +
+#  7 / 1   16        54  74   94   f4              +
+#  8 / 0   14        52  72   92   f2                    +
+#  8 / 1   17        55  75   95   f5                          +
+#
+# Phase Generator:
+#
+# channel  operator  register number   Bass  High  Snare Tom  Top
+# / slot   number    MULTIPLE          Drum  Hat   Drum  Tom  Cymbal
+#  6 / 0   12        30                +
+#  6 / 1   15        33                +
+#  7 / 0   13        31                      +     +           +
+#  7 / 1   16        34                -----  n o t  u s e d -----
+#  8 / 0   14        32                                  +
+#  8 / 1   17        35                      +                 +
+#
+# channel  operator  register number   Bass  High  Snare Tom  Top
+# number   number    BLK/FNUM2 FNUM    Drum  Hat   Drum  Tom  Cymbal
+#    6     12,15     B6        A6      +
+#
+#    7     13,16     B7        A7            +     +           +
+#
+#    8     14,17     B8        A8            +           +     +
+
+# calculate rhythm
+inline func calc_rhythm(chip: Opl*, noise: u32):
+    let slot7_1: Slot* = &chip.channels[7].slots[0]
+    let slot7_2: Slot* = &chip.channels[7].slots[1]
+    let slot8_1: Slot* = &chip.channels[8].slots[0]
+    let slot8_2: Slot* = &chip.channels[8].slots[1]
+
+    # Bass Drum (verified on real YM3812):
+    #  - depends on the channel 6 'connect' register:
+    #      when connect = 0 it works the same as in normal (non-rhythm) mode (op1->op2->out)
+    #      when connect = 1 _only_ operator 2 is present on output (op2->out), operator 1 is ignored
+    #  - output sample always is multiplied by 2
+
+    chip.phase_modulation = 0
+    # SLOT 1
+    let slot6_1: Slot* = &chip.channels[6].slots[0]
+    var env = volume_calc(chip, slot6_1)
+
+    var feedback = slot6_1.op1_out[0] + slot6_1.op1_out[1]
+    slot6_1.op1_out[0] = slot6_1.op1_out[1]
+
+    if slot6_1.con == 0:
+        chip.phase_modulation = slot6_1.op1_out[0]
+    # else ignore output of operator 1
+
+    slot6_1.op1_out[1] = 0
+    if env < env_quiet:
+        if slot6_1.fb == 0:
+            feedback = 0
+        slot6_1.op1_out[1] = op_calc1(chip, slot6_1.cnt, env, feedback << slot6_1.fb, slot6_1.wavetable)
+
+    # SLOT 2
+    let slot6_2: Slot* = &chip.channels[6].slots[1]
+    env = volume_calc(chip, slot6_2)
+    if env < env_quiet:
+        chip.output += op_calc(chip, slot6_2.cnt, env, chip.phase_modulation, slot6_2.wavetable) * 2
+
+    # Phase generation is based on:
+    # HH  (13) channel 7->slot 1 combined with channel 8->slot 2 (same combination as TOP CYMBAL but different output phases)
+    # SD  (16) channel 7->slot 1
+    # TOM (14) channel 8->slot 1
+    # TOP (17) channel 7->slot 1 combined with channel 8->slot 2 (same combination as HIGH HAT but different output phases)
+
+    # Envelope generation based on:
+    # HH  channel 7->slot1
+    # SD  channel 7->slot2
+    # TOM channel 8->slot1
+    # TOP channel 8->slot2
+
+    # The following formulas can be well optimized.
+    # I leave them in direct form for now (in case I've missed something).
+
+    # High Hat (verified on real YM3812)
+    env = volume_calc(chip, slot7_1)
+    if env < env_quiet:
+        # high hat phase generation:
+        #     phase = d0 or 234 (based on frequency only)
+        #     phase = 34 or 2d0 (based on noise)
+
+        # base frequency derived from operator 1 in channel 7
+        let bit7 = ((slot7_1.cnt >> freq_sh) >> 7) & 1
+        let bit3 = ((slot7_1.cnt >> freq_sh) >> 3) & 1
+        let bit2 = ((slot7_1.cnt >> freq_sh) >> 2) & 1
+
+        let res1 = (bit2 ^ bit7) | bit3
+
+        # when res1 = 0 phase = 0x000 | 0xd0;
+        # when res1 = 1 phase = 0x200 | (0xd0>>2);
+        var phase: u32 = (0x200 | (0xd0 >> 2)) if res1 != 0 else 0xd0
+
+        # enable gate based on frequency of operator 2 in channel 8
+        let bit5e = ((slot8_2.cnt >> freq_sh) >> 5) & 1
+        let bit3e = ((slot8_2.cnt >> freq_sh) >> 3) & 1
+
+        let res2 = bit3e ^ bit5e
+
+        # when res2 = 0 pass the phase from calculation above (res1);
+        # when res2 = 1 phase = 0x200 | (0xd0>>2);
+        if res2 != 0:
+            phase = 0x200 | (0xd0 >> 2)
+
+        # when phase & 0x200 is set and noise=1 then phase = 0x200|0xd0
+        # when phase & 0x200 is set and noise=0 then phase = 0x200|(0xd0>>2), ie no change
+        if (phase & 0x200) != 0:
+            if noise != 0:
+                phase = 0x200 | 0xd0
+        # when phase & 0x200 is clear and noise=1 then phase = 0xd0>>2
+        # when phase & 0x200 is clear and noise=0 then phase = 0xd0, ie no change
+        else:
+            if noise != 0:
+                phase = 0xd0 >> 2
+
+        chip.output += op_calc(chip, phase << freq_sh, env, 0, slot7_1.wavetable) * 2
+
+    # Snare Drum (verified on real YM3812)
+    env = volume_calc(chip, slot7_2)
+    if env < env_quiet:
+        # base frequency derived from operator 1 in channel 7
+        let bit8 = ((slot7_1.cnt >> freq_sh) >> 8) & 1
+
+        # when bit8 = 0 phase = 0x100;
+        # when bit8 = 1 phase = 0x200;
+        var phase: u32 = 0x200 if bit8 != 0 else 0x100
+
+        # Noise bit XOR'es phase by 0x100
+        # when noisebit = 0 pass the phase from calculation above
+        # when noisebit = 1 phase ^= 0x100;
+        # in other words: phase ^= (noisebit<<8);
+        if noise != 0:
+            phase ^= 0x100
+
+        chip.output += op_calc(chip, phase << freq_sh, env, 0, slot7_2.wavetable) * 2
+
+    # Tom Tom (verified on real YM3812)
+    env = volume_calc(chip, slot8_1)
+    if env < env_quiet:
+        chip.output += op_calc(chip, slot8_1.cnt, env, 0, slot8_1.wavetable) * 2
+
+    # Top Cymbal (verified on real YM3812)
+    env = volume_calc(chip, slot8_2)
+    if env < env_quiet:
+        # base frequency derived from operator 1 in channel 7
+        let bit7 = ((slot7_1.cnt >> freq_sh) >> 7) & 1
+        let bit3 = ((slot7_1.cnt >> freq_sh) >> 3) & 1
+        let bit2 = ((slot7_1.cnt >> freq_sh) >> 2) & 1
+
+        let res1 = (bit2 ^ bit7) | bit3
+
+        # when res1 = 0 phase = 0x000 | 0x100;
+        # when res1 = 1 phase = 0x200 | 0x100;
+        var phase: u32 = 0x300 if res1 != 0 else 0x100
+
+        # enable gate based on frequency of operator 2 in channel 8
+        let bit5e = ((slot8_2.cnt >> freq_sh) >> 5) & 1
+        let bit3e = ((slot8_2.cnt >> freq_sh) >> 3) & 1
+
+        let res2 = bit3e ^ bit5e
+        # when res2 = 0 pass the phase from calculation above (res1);
+        # when res2 = 1 phase = 0x200 | 0x100;
+        if res2 != 0:
+            phase = 0x300
+
+        chip.output += op_calc(chip, phase << freq_sh, env, 0, slot8_2.wavetable) * 2
+
+inline func key_on(slot: Slot*, key_set: u32):
+    if slot.key == 0:
+        # restart Phase Generator
+        slot.cnt = 0
+        # phase -> Attack
+        slot.state = eg_att
+    slot.key |= key_set
+
+inline func key_off(slot: Slot*, key_clr: u32):
+    if slot.key != 0:
+        slot.key &= key_clr
+
+        if slot.key == 0:
+            # phase -> Release
+            if slot.state > eg_rel:
+                slot.state = eg_rel
+
+# the attack rate's shift and selector, with the key scale applied (shared by CALC_FCSLOT and set_ar_dr)
+inline func set_attack_rate(slot: Slot*):
+    if (slot.ar + slot.ksr) < 16 + 62:
+        slot.eg_sh_ar = eg_rate_shift[slot.ar + slot.ksr]
+        slot.eg_sel_ar = eg_rate_select[slot.ar + slot.ksr]
+    else:
+        slot.eg_sh_ar = 0
+        slot.eg_sel_ar = 13 * rate_steps
+
+# update phase increment counter of operator (also update the EG rates if necessary)
+inline func calc_fcslot(ch: Channel*, slot: Slot*):
+    # (frequency) phase increment counter
+    slot.incr = ch.fc *% slot.mul
+    let ksr = ch.kcode >> slot.ksr_shift
+
+    if slot.ksr != ksr:
+        slot.ksr = ksr
+
+        # calculate envelope generator rates
+        set_attack_rate(slot)
+        slot.eg_sh_dr = eg_rate_shift[slot.dr + slot.ksr]
+        slot.eg_sel_dr = eg_rate_select[slot.dr + slot.ksr]
+        slot.eg_sh_rr = eg_rate_shift[slot.rr + slot.ksr]
+        slot.eg_sel_rr = eg_rate_select[slot.rr + slot.ksr]
+
+# set multi,am,vib,EG-TYP,KSR,mul
+func set_mul(chip: Opl*, slot_index: u32, v: u32):
+    let ch: Channel* = &chip.channels[slot_index // 2]
+    let slot: Slot* = &ch.slots[slot_index & 1]
+
+    slot.mul = mul_tab[v & 0x0f]
+    slot.ksr_shift = 0 if (v & 0x10) != 0 else 2
+    slot.eg_type = v & 0x20
+    slot.vib = v & 0x40
+    slot.am_mask = ~0 if (v & 0x80) != 0 else 0
+    calc_fcslot(ch, slot)
+
+# set ksl & tl
+func set_ksl_tl(chip: Opl*, slot_index: u32, v: u32):
+    let ch: Channel* = &chip.channels[slot_index // 2]
+    let slot: Slot* = &ch.slots[slot_index & 1]
+    let level = v >> 6      # 0 / 1.5 / 3.0 / 6.0 dB/OCT
+
+    slot.ksl = 3 - level if level != 0 else 31
+    slot.tl = (v & 0x3f) << (env_bits - 1 - 7)     # 7 bits TL (bit 6 = always 0)
+
+    slot.tll = slot.tl + (ch.ksl_base >> slot.ksl)
+
+# set attack rate & decay rate
+func set_ar_dr(chip: Opl*, slot_index: u32, v: u32):
+    let slot: Slot* = &chip.channels[slot_index // 2].slots[slot_index & 1]
+
+    slot.ar = 16 + ((v >> 4) << 2) if (v >> 4) != 0 else 0
+
+    set_attack_rate(slot)
+
+    slot.dr = 16 + ((v & 0x0f) << 2) if (v & 0x0f) != 0 else 0
+    slot.eg_sh_dr = eg_rate_shift[slot.dr + slot.ksr]
+    slot.eg_sel_dr = eg_rate_select[slot.dr + slot.ksr]
+
+# set sustain level & release rate
+func set_sl_rr(chip: Opl*, slot_index: u32, v: u32):
+    let slot: Slot* = &chip.channels[slot_index // 2].slots[slot_index & 1]
+
+    slot.sl = sl_tab[v >> 4]
+
+    slot.rr = 16 + ((v & 0x0f) << 2) if (v & 0x0f) != 0 else 0
+    slot.eg_sh_rr = eg_rate_shift[slot.rr + slot.ksr]
+    slot.eg_sel_rr = eg_rate_select[slot.rr + slot.ksr]
+
+# write a value v to register r on OPL chip; both are already 8 bits
+func write_reg(chip: Opl*, r: u32, v: u32):
+    let family = r & 0xe0
+    if family == 0x00:      # 00-1f:control
+        let control = r & 0x1f
+        if control == 0x01:     # waveform select enable (the YM3812 has OPL_TYPE_WAVESEL)
+            chip.wavesel = v & 0x20
+            # do not change the waveform previously selected
+        elif control == 0x08:   # MODE: CSM,NOTESEL,x,x,smpl,da/ad,64k,rom
+            chip.mode = v
+        # 02-04 (timers, IRQ mask) only drive the status and timer handlers, which are not ported
+    elif family == 0x20:    # am ON, vib ON, ksr, eg_type, mul
+        let slot_index = slot_array[r & 0x1f]
+        if slot_index < 0: return
+        set_mul(chip, (u32)slot_index, v)
+    elif family == 0x40:
+        let slot_index = slot_array[r & 0x1f]
+        if slot_index < 0: return
+        set_ksl_tl(chip, (u32)slot_index, v)
+    elif family == 0x60:
+        let slot_index = slot_array[r & 0x1f]
+        if slot_index < 0: return
+        set_ar_dr(chip, (u32)slot_index, v)
+    elif family == 0x80:
+        let slot_index = slot_array[r & 0x1f]
+        if slot_index < 0: return
+        set_sl_rr(chip, (u32)slot_index, v)
+    elif family == 0xa0:
+        if r == 0xbd:           # am depth, vibrato depth, r,bd,sd,tom,tc,hh
+            chip.lfo_am_depth = v & 0x80
+            chip.lfo_pm_depth_range = 8 if (v & 0x40) != 0 else 0
+
+            chip.rhythm = v & 0x3f
+
+            let ch6: Channel* = &chip.channels[6]
+            let ch7: Channel* = &chip.channels[7]
+            let ch8: Channel* = &chip.channels[8]
+            if (chip.rhythm & 0x20) != 0:
+                # BD key on/off
+                if (v & 0x10) != 0:
+                    key_on(&ch6.slots[0], 2)
+                    key_on(&ch6.slots[1], 2)
+                else:
+                    key_off(&ch6.slots[0], ~2)
+                    key_off(&ch6.slots[1], ~2)
+                # HH key on/off
+                if (v & 0x01) != 0: key_on(&ch7.slots[0], 2)
+                else: key_off(&ch7.slots[0], ~2)
+                # SD key on/off
+                if (v & 0x08) != 0: key_on(&ch7.slots[1], 2)
+                else: key_off(&ch7.slots[1], ~2)
+                # TOM key on/off
+                if (v & 0x04) != 0: key_on(&ch8.slots[0], 2)
+                else: key_off(&ch8.slots[0], ~2)
+                # TOP-CY key on/off
+                if (v & 0x02) != 0: key_on(&ch8.slots[1], 2)
+                else: key_off(&ch8.slots[1], ~2)
+            else:
+                # BD key off
+                key_off(&ch6.slots[0], ~2)
+                key_off(&ch6.slots[1], ~2)
+                # HH key off
+                key_off(&ch7.slots[0], ~2)
+                # SD key off
+                key_off(&ch7.slots[1], ~2)
+                # TOM key off
+                key_off(&ch8.slots[0], ~2)
+                # TOP-CY off
+                key_off(&ch8.slots[1], ~2)
+            return
+        # keyon,block,fnum
+        if (r & 0x0f) > 8: return
+        let ch: Channel* = &chip.channels[r & 0x0f]
+        var block_fnum: u32
+        if (r & 0x10) == 0:     # a0-a8
+            block_fnum = (ch.block_fnum & 0x1f00) | v
+        else:                   # b0-b8
+            block_fnum = ((v & 0x1f) << 8) | (ch.block_fnum & 0xff)
+
+            if (v & 0x20) != 0:
+                key_on(&ch.slots[0], 1)
+                key_on(&ch.slots[1], 1)
+            else:
+                key_off(&ch.slots[0], ~1)
+                key_off(&ch.slots[1], ~1)
+        # update
+        if ch.block_fnum != block_fnum:
+            let block = block_fnum >> 10
+
+            ch.block_fnum = block_fnum
+
+            ch.ksl_base = ksl_tab[block_fnum >> 6]
+            ch.fc = chip.fn_tab[block_fnum & 0x03ff] >> (7 - block)
+
+            # BLK 2,1,0 bits -> bits 3,2,1 of kcode
+            ch.kcode = (ch.block_fnum & 0x1c00) >> 9
+
+            # the info below is actually opposite to what is stated in the Manuals (verifed on real YM3812)
+            # if notesel == 0 -> lsb of kcode is bit 10 (MSB) of fnum
+            # if notesel == 1 -> lsb of kcode is bit 9 (MSB-1) of fnum
+            if (chip.mode & 0x40) != 0:
+                ch.kcode |= (ch.block_fnum & 0x100) >> 8    # notesel == 1
+            else:
+                ch.kcode |= (ch.block_fnum & 0x200) >> 9    # notesel == 0
+
+            # refresh Total Level in both SLOTs of this channel
+            ch.slots[0].tll = ch.slots[0].tl + (ch.ksl_base >> ch.slots[0].ksl)
+            ch.slots[1].tll = ch.slots[1].tl + (ch.ksl_base >> ch.slots[1].ksl)
+
+            # refresh frequency counter in both SLOTs of this channel
+            calc_fcslot(ch, &ch.slots[0])
+            calc_fcslot(ch, &ch.slots[1])
+    elif family == 0xc0:
+        # FB,C
+        if (r & 0x0f) > 8: return
+        let ch: Channel* = &chip.channels[r & 0x0f]
+        ch.slots[0].fb = ((v >> 1) & 7) + 7 if ((v >> 1) & 7) != 0 else 0
+        ch.slots[0].con = v & 1
+    elif family == 0xe0:    # waveform select
+        # simply ignore write to the waveform select register if selecting not enabled in test register
+        if chip.wavesel != 0:
+            let slot_index = slot_array[r & 0x1f]
+            if slot_index < 0: return
+            chip.channels[slot_index // 2].slots[slot_index & 1].wavetable = (v & 0x03) * sin_len
+
+# Generate samples (YM3812UpdateOne, its left channel), as 16-bit little-endian words.
+func update(chip: Opl*, pcm: u8[]):
+    let rhythm = chip.rhythm & 0x20
+    let length = pcm.length // 2
+
+    for i: usize in 0..<length:
+        chip.output = 0
+
+        advance_lfo(chip)
+
+        # FM part
+        for c: usize in 0..<6:
+            calc_channel(chip, &chip.channels[c])
+
+        if rhythm == 0:
+            calc_channel(chip, &chip.channels[6])
+            calc_channel(chip, &chip.channels[7])
+            calc_channel(chip, &chip.channels[8])
+        else:       # Rhythm part
+            calc_rhythm(chip, (chip.noise_rng >> 0) & 1)
+
+        var lt = chip.output
+
+        lt <<= 2
+
+        # limit check
+        if lt > 32767:
+            lt = 32767
+        elif lt < -32768:
+            lt = -32768
+
+        # store to sound buffer
+        pcm[i * 2] = (u8)lt
+        pcm[i * 2 + 1] = (u8)(lt >> 8)
+
+        advance(chip)
+
+## FNV-1a over 32-bit words, for comparing tables with fmopl.c's.
+func words_hash(words: const u32[]) -> u32:
+    var h: u32 = 0x811c9dc5
+    for word in words:
+        h = (h ^ word) *% 0x01000193
+    return h
+
+test "the generated tables are fmopl.c's, word for word":
+    let chip = try new Opl
+    defer free(chip)
+    init_tables(chip)
+    var tl_words: u32[6144]
+    for i: usize in 0..<6144:
+        tl_words[i] = (u32)chip.tl_tab[i]
+    # hashes of init_tables' tl_tab and sin_tab, taken from the C core
+    assert(words_hash(tl_words) == 0xdd201725)
+    assert(words_hash(chip.sin_tab) == 0xd279e7f5)
+    assert(chip.tl_tab[0] == 4084 and chip.tl_tab[1] == -4084 and chip.sin_tab[0] == 4274)

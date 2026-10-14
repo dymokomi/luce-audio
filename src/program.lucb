@@ -1,0 +1,918 @@
+## A compiled song: tracks of units, each unit an instrument or effect
+## whose patch of nodes runs once per sounding voice, and the lanes of
+## notes and curves that play them. `compile` builds one on the main thread
+## into a single arena; the audio thread takes it whole (`carry` moves the
+## running state over from the program before it) and the main thread frees
+## it whole once it is retired. Running one (`run_track`) allocates nothing.
+import memory
+import result
+import dsp
+import models
+import effects
+import studio
+import machines
+import mixing
+import fm
+import kinds
+import scale
+from scale import Scale, Key
+from memory import Arena
+from dsp import State, Ports, Signal, Samples, chunk
+from luce_std.collections import List
+from luce_std import sort
+
+pub let most_voices: usize = 32
+pub let most_controls: usize = 8
+pub let most_sounding: usize = 64
+
+pub struct Node:
+    pub var id: i64
+    pub var kind: u32
+    ## The pool slot each input reads (-1 unwired) and each output writes.
+    pub var inputs: i32[8]
+    pub var outputs: i32[4]
+    ## Parameters as set, and as the audio follows them (smoothed).
+    pub var target: f32[16]
+    pub var value: f32[16]
+
+pub struct Voice:
+    pub var active: bool
+    pub var gate: bool
+    pub var retrigger: bool
+    pub var note: i32
+    ## The note asked for, before the scale moved it: what a key's release names.
+    pub var written: i32
+    pub var pitch: f32
+    pub var velocity: f32
+    pub var pan: f32
+    pub var age: u64
+    ## The loudest sample this voice gave its unit in the last block, and
+    ## how long (s) it has been silent.
+    pub var loudness: f32
+    pub var quiet: f32
+    pub var states: State[]
+
+pub struct Unit:
+    pub var id: i64
+    pub var track: u32
+    pub var nodes: Node[]
+    pub var voices: Voice[]
+    ## The units whose output this one hears at its Audio In.
+    pub var sources: u32[]
+    ## Whether its output goes to its track's bus.
+    pub var to_track: bool
+    ## Whether lanes or the keyboard play it: then only sounding voices run;
+    ## otherwise (an effect) its one voice always runs.
+    pub var played: bool
+    pub var envelopes: u32[]
+    ## Whether its patch rings out by itself after a note's end (a drum, an
+    ## echo): then a released voice lives on until it has been silent for
+    ## `hold` seconds (an echo's line may still hold what comes back).
+    pub var rings: bool
+    pub var hold: f32
+    pub var in_left: f32[]
+    pub var in_right: f32[]
+    pub var out_left: f32[]
+    pub var out_right: f32[]
+    pub var controls: f32[]
+    pub var clock: u64
+
+pub struct Track:
+    pub var id: i64
+    pub var channels: u32
+    pub var volume: f32
+    pub var pan: f32
+    pub var mute: bool
+    pub var solo: bool
+    ## The master bus: its effects hear every other track's mix, and what
+    ## it gives is the song's output.
+    pub var master: bool
+    pub var first: u32
+    pub var count: u32
+    pub var left: f32[]
+    pub var right: f32[]
+    ## A curve lane drives its volume or pan (per block, not the setting).
+    pub var volume_curve: i32
+    pub var pan_curve: i32
+    ## Its notes' scale: 0 as written, 1 the song's, 2 its own `keys` (the
+    ## song's while it has none).
+    pub var scale_mode: u32
+    pub var keys: Key[]
+    ## What it plays live: the MIDI it hears (-1 none, 0 every source, else a
+    ## source's unique id) on `midi_channel` (0 any, 1..16), into `listens`.
+    pub var midi_source: i64
+    pub var midi_channel: i32
+    pub var listens: u32[]
+
+pub struct Note:
+    pub var start: f64
+    pub var end: f64
+    pub var pitch: i32
+    pub var velocity: f32
+    pub var pan: f32
+
+pub struct Point:
+    pub var beat: f64
+    pub var value: f32
+    ## 0 linear to the next point, 1 holds until it.
+    pub var shape: u32
+
+pub struct Sounding:
+    pub var pitch: i32
+    pub var end: f64
+
+pub struct Lane:
+    pub var id: i64
+    pub var track: u32
+    pub var curve: bool
+    pub var notes: Note[]
+    pub var points: Point[]
+    ## A note lane's units; a curve lane's unit (-1: its track) and control.
+    pub var targets: u32[]
+    pub var unit: i32
+    pub var control: u32
+    ## The next note to start, and the notes started and not yet ended.
+    pub var cursor: usize
+    pub var sounding: Sounding[64]
+    pub var count: usize
+
+pub struct Program:
+    pub var arena: Arena
+    pub var rate: f64
+    pub var tracks: Track[]
+    pub var units: Unit[]
+    pub var lanes: Lane[]
+    pub var pool: f32[]
+    pub var zeros: f32[]
+    pub var gates: f32[]
+    pub var any_solo: bool
+    ## The master track's index (-1: none) and the mix it hears.
+    pub var master: i32
+    pub var mix_left: f32[]
+    pub var mix_right: f32[]
+    ## The block's position and tempo, set by the engine before it runs.
+    pub var beat: f64
+    pub var beats_per_sample: f64
+    ## The song's scale keys, and the scale of the track running now.
+    pub var keys: Key[]
+    pub var scale: Scale
+
+# ---------------------------------------------------------------- building
+
+pub struct TrackDraft:
+    pub var id: i64
+    pub var channels: u32
+    pub var volume: f32
+    pub var pan: f32
+    pub var mute: bool
+    pub var solo: bool
+    pub var master: bool
+    pub var scale_mode: u32
+    pub var midi_source: i64
+    pub var midi_channel: i32
+
+pub struct UnitDraft:
+    pub var id: i64
+    pub var track: u32
+    pub var voices: u32
+    pub var to_track: bool
+
+pub struct NodeDraft:
+    pub var unit: u32
+    pub var id: i64
+    pub var kind: u32
+    pub var params: f32[16]
+
+pub struct WireDraft:
+    pub var unit: u32
+    pub var source: u32
+    pub var output: u32
+    pub var target: u32
+    pub var input: u32
+
+pub struct FeedDraft:
+    pub var unit: u32
+    pub var source: u32
+
+pub struct LaneDraft:
+    pub var id: i64
+    pub var track: u32
+    pub var curve: bool
+    pub var unit: i32
+    pub var control: u32
+
+pub struct NoteDraft:
+    pub var lane: u32
+    pub var note: Note
+
+pub struct PointDraft:
+    pub var lane: u32
+    pub var point: Point
+
+## Track `track` plays unit `unit` from the MIDI it hears.
+pub struct ListenDraft:
+    pub var track: u32
+    pub var unit: u32
+
+## A scale key of track `track`, or with -1 of the song.
+pub struct KeyDraft:
+    pub var track: i32
+    pub var key: Key
+
+pub struct TargetDraft:
+    pub var lane: u32
+    pub var unit: u32
+
+## What the main thread adds up between `begin` and `commit`.
+pub struct Builder:
+    pub var tracks: List[TrackDraft]
+    pub var units: List[UnitDraft]
+    pub var nodes: List[NodeDraft]
+    pub var wires: List[WireDraft]
+    pub var feeds: List[FeedDraft]
+    pub var lanes: List[LaneDraft]
+    pub var notes: List[NoteDraft]
+    pub var points: List[PointDraft]
+    pub var targets: List[TargetDraft]
+    pub var keys: List[KeyDraft]
+    pub var listens: List[ListenDraft]
+
+    pub func clear():
+        self.tracks.clear()
+        self.units.clear()
+        self.nodes.clear()
+        self.wires.clear()
+        self.feeds.clear()
+        self.lanes.clear()
+        self.notes.clear()
+        self.points.clear()
+        self.targets.clear()
+        self.keys.clear()
+        self.listens.clear()
+
+    pub func destroy():
+        self.tracks.destroy()
+        self.units.destroy()
+        self.nodes.destroy()
+        self.wires.destroy()
+        self.feeds.destroy()
+        self.lanes.destroy()
+        self.notes.destroy()
+        self.points.destroy()
+        self.targets.destroy()
+        self.keys.destroy()
+        self.listens.destroy()
+
+func note_before(a: Note, b: Note) -> bool:
+    return a.start < b.start
+
+func point_before(a: Point, b: Point) -> bool:
+    return a.beat < b.beat
+
+func key_before(a: Key, b: Key) -> bool:
+    return a.beat < b.beat
+
+## Track `track`'s keys (-1: the song's) from `drafts`, sorted, in `arena`.
+func keys_of(arena: memory.Allocator, drafts: const KeyDraft[], track: i32) -> Key[]!:
+    var count: usize = 0
+    for draft in drafts:
+        if draft.track == track: count += 1
+    var keys = try new Key[count] in arena
+    var k: usize = 0
+    for draft in drafts:
+        if draft.track == track:
+            keys[k] = draft.key
+            k += 1
+    sort.stable(keys, key_before)
+    return keys
+
+## The scale `track`'s notes take at `beat`.
+pub func track_scale(program: const Program*, track: const Track*, beat: f64) -> Scale:
+    let every = Scale(root = 0, mask = scale.every_note)
+    if track.scale_mode == 0: return every
+    let song = scale.key_at(program.keys, beat, every)
+    if track.scale_mode == 2: return scale.key_at(track.keys, beat, song)
+    return song
+
+## Room for `count` values of `size` bytes, aligned, in the arena.
+func room(count: usize, size: usize) -> usize:
+    return count * size + 64
+
+## The program `builder` describes, at `rate`.
+pub func compile(builder: const Builder*, rate: f64) -> Program*!:
+    let track_drafts = builder.tracks.view()
+    let unit_drafts = builder.units.view()
+    let node_drafts = builder.nodes.view()
+    let wires = builder.wires.view()
+    let feeds = builder.feeds.view()
+    let lane_drafts = builder.lanes.view()
+    let note_drafts = builder.notes.view()
+    let point_drafts = builder.points.view()
+    let target_drafts = builder.targets.view()
+    let key_drafts = builder.keys.view()
+    let listen_drafts = builder.listens.view()
+    for draft in unit_drafts:
+        if (usize)draft.track >= track_drafts.length:
+            error(result.invalid, "a unit names a track that does not exist")
+        if draft.voices < 1 or (usize)draft.voices > most_voices:
+            error(result.invalid, "a unit has 1 to 32 voices")
+    for draft in node_drafts:
+        if (usize)draft.unit >= unit_drafts.length or draft.kind >= kinds.count:
+            error(result.invalid, "a node names a unit or kind that does not exist")
+    for draft in lane_drafts:
+        if (usize)draft.track >= track_drafts.length:
+            error(result.invalid, "a lane names a track that does not exist")
+    # What each piece needs, to size the arena once.
+    var bytes: usize = 4096
+    bytes += room(track_drafts.length, memory.size_of(Track)) + track_drafts.length * room(2 * chunk, 4)
+    bytes += room(unit_drafts.length, memory.size_of(Unit)) + unit_drafts.length * (room(4 * chunk + most_controls * chunk, 4) + 6 * 64)
+    bytes += room(lane_drafts.length, memory.size_of(Lane)) + lane_drafts.length * 3 * 64
+    bytes += room(note_drafts.length, memory.size_of(Note)) + room(point_drafts.length, memory.size_of(Point))
+    bytes += room(target_drafts.length, 4) + room(feeds.length, 4)
+    bytes += room(key_drafts.length, memory.size_of(Key)) + (track_drafts.length + 1) * 64
+    bytes += room(listen_drafts.length, 4) + track_drafts.length * 64
+    var most_slots: usize = 1
+    for u in 0..<unit_drafts.length:
+        let voices = (usize)unit_drafts[u].voices
+        var nodes: usize = 0
+        var slots: usize = 0
+        for draft in node_drafts:
+            if (usize)draft.unit == u:
+                nodes += 1
+                slots += kinds.output_count(draft.kind)
+                bytes += voices * line_bytes(draft.kind, rate)
+        if slots > most_slots: most_slots = slots
+        bytes += room(nodes, memory.size_of(Node)) + room(nodes, 4) + room(voices, memory.size_of(Voice)) + voices * room(nodes, memory.size_of(State))
+    bytes += room(most_slots * chunk + 2 * chunk, 4)
+    let program = try new Program(arena = try Arena.over(memory.heap, bytes), rate = rate, any_solo = false) in memory.heap
+    errdefer:
+        program.arena.destroy()
+        free(program) in memory.heap
+    let arena: memory.Allocator = &program.arena
+    program.pool = try new f32[most_slots * chunk] in arena
+    program.zeros = try new f32[chunk] in arena
+    program.gates = try new f32[chunk] in arena
+    program.mix_left = try new f32[chunk] in arena
+    program.mix_right = try new f32[chunk] in arena
+    program.master = -1
+    program.keys = try keys_of(arena, key_drafts, -1)
+    program.scale = Scale(root = 0, mask = scale.every_note)
+    program.tracks = try new Track[track_drafts.length] --- in arena
+    for t in 0..<track_drafts.length:
+        let draft = track_drafts[t]
+        program.tracks[t] = Track(id = draft.id, channels = 1 if draft.channels == 1 else 2, volume = draft.volume, pan = draft.pan, mute = draft.mute, solo = draft.solo, master = draft.master,
+                                  first = 0, count = 0, left = try new f32[chunk] in arena, right = try new f32[chunk] in arena, volume_curve = -1, pan_curve = -1,
+                                  scale_mode = draft.scale_mode, keys = try keys_of(arena, key_drafts, (i32)t),
+                                  midi_source = draft.midi_source, midi_channel = draft.midi_channel, listens = try new u32[0] in arena)
+        if draft.solo: program.any_solo = true
+        if draft.master and program.master < 0: program.master = (i32)t
+    # Units run track by track, and within a track after the units they hear.
+    let order = try unit_order(unit_drafts, feeds, track_drafts.length)
+    defer free(order) in memory.heap
+    var position = try new u32[unit_drafts.length] in memory.heap
+    defer free(position) in memory.heap
+    for at in 0..<order.length:
+        position[(usize)order[at]] = (u32)at
+    program.units = try new Unit[unit_drafts.length] --- in arena
+    for at in 0..<order.length:
+        let draft_index = (usize)order[at]
+        let draft = unit_drafts[draft_index]
+        var track = &program.tracks[(usize)draft.track]
+        if track.count == 0: track.first = (u32)at
+        track.count += 1
+        program.units[at] = try build_unit(arena, draft, (u32)draft_index, node_drafts, wires, rate)
+        var sources: usize = 0
+        for feed in feeds:
+            if (usize)feed.unit == draft_index and (usize)feed.source < unit_drafts.length and unit_drafts[(usize)feed.source].track == draft.track:
+                sources += 1
+        var instrument = &program.units[at]
+        instrument.sources = try new u32[sources] in arena
+        var s: usize = 0
+        for feed in feeds:
+            if (usize)feed.unit == draft_index and (usize)feed.source < unit_drafts.length and unit_drafts[(usize)feed.source].track == draft.track:
+                # A feed from a unit that runs later (a cycle) is dropped.
+                if position[(usize)feed.source] < (u32)at:
+                    instrument.sources[s] = position[(usize)feed.source]
+                    s += 1
+        instrument.sources = instrument.sources[0..<s]
+    for t in 0..<track_drafts.length:
+        var count: usize = 0
+        for listen in listen_drafts:
+            if (usize)listen.track == t and (usize)listen.unit < unit_drafts.length: count += 1
+        var listens = try new u32[count] in arena
+        var k: usize = 0
+        for listen in listen_drafts:
+            if (usize)listen.track == t and (usize)listen.unit < unit_drafts.length:
+                listens[k] = position[(usize)listen.unit]
+                program.units[(usize)listens[k]].played = true
+                k += 1
+        program.tracks[t].listens = listens
+    program.lanes = try new Lane[lane_drafts.length] --- in arena
+    for l in 0..<lane_drafts.length:
+        let draft = lane_drafts[l]
+        var notes: usize = 0
+        var points: usize = 0
+        var targets: usize = 0
+        for note in note_drafts:
+            if (usize)note.lane == l: notes += 1
+        for point in point_drafts:
+            if (usize)point.lane == l: points += 1
+        for target in target_drafts:
+            if (usize)target.lane == l and (usize)target.unit < unit_drafts.length: targets += 1
+        var lane = Lane(id = draft.id, track = draft.track, curve = draft.curve, notes = try new Note[notes] in arena, points = try new Point[points] in arena,
+                        targets = try new u32[targets] in arena, unit = -1, control = draft.control, cursor = 0, count = 0)
+        var n: usize = 0
+        for note in note_drafts:
+            if (usize)note.lane == l:
+                lane.notes[n] = note.note
+                n += 1
+        sort.stable(lane.notes, note_before)
+        var p: usize = 0
+        for point in point_drafts:
+            if (usize)point.lane == l:
+                lane.points[p] = point.point
+                p += 1
+        sort.stable(lane.points, point_before)
+        var g: usize = 0
+        for target in target_drafts:
+            if (usize)target.lane == l and (usize)target.unit < unit_drafts.length:
+                let instrument = position[(usize)target.unit]
+                lane.targets[g] = instrument
+                program.units[(usize)instrument].played = true
+                g += 1
+        if draft.curve:
+            if draft.unit >= 0 and (usize)draft.unit < unit_drafts.length:
+                lane.unit = (i32)position[(usize)draft.unit]
+            elif draft.unit < 0:
+                if draft.control == 0: program.tracks[(usize)draft.track].volume_curve = (i32)l
+                else: program.tracks[(usize)draft.track].pan_curve = (i32)l
+        program.lanes[l] = lane
+    return program
+
+## Free a program and everything it holds.
+pub func destroy(program: Program*):
+    program.arena.destroy()
+    free(program) in memory.heap
+
+## The bytes a node of `kind` needs a voice for its line.
+func line_bytes(kind: u32, rate: f64) -> usize:
+    let floats = line_floats(kind, rate)
+    return room(floats, 4) if floats > 0 else 0
+
+## The samples of line memory a node of `kind` needs a voice.
+func line_floats(kind: u32, rate: f64) -> usize:
+    if kind == kinds.delay: return dsp.line_length(2.0, rate)
+    if kind == kinds.reverb: return dsp.reverb_length(rate)
+    let studio_floats = studio.memory_of(kind, rate)
+    if studio_floats > 0: return studio_floats
+    return models.memory(kind, rate)
+
+## The draft units' run order: by track, then each after those it hears.
+func unit_order(units: const UnitDraft[], feeds: const FeedDraft[], tracks: usize) -> u32[]!:
+    var order = try new u32[units.length] in memory.heap
+    errdefer free(order) in memory.heap
+    var placed = try new bool[units.length] in memory.heap
+    defer free(placed) in memory.heap
+    var at: usize = 0
+    for track in 0..<tracks:
+        # Repeatedly place a unit of this track whose sources are placed;
+        # what a cycle leaves goes last, in draft order.
+        var progress = true
+        while progress:
+            progress = false
+            for u in 0..<units.length:
+                if placed[u] or (usize)units[u].track != track: continue
+                var ready = true
+                for feed in feeds:
+                    if (usize)feed.unit == u and (usize)feed.source < units.length and (usize)feed.source != u and not placed[(usize)feed.source] and (usize)units[(usize)feed.source].track == track:
+                        ready = false
+                if ready:
+                    order[at] = (u32)u
+                    placed[u] = true
+                    at += 1
+                    progress = true
+        for u in 0..<units.length:
+            if not placed[u] and (usize)units[u].track == track:
+                order[at] = (u32)u
+                placed[u] = true
+                at += 1
+    return order
+
+func build_unit(arena: memory.Allocator, draft: UnitDraft, index: u32, drafts: const NodeDraft[], wires: const WireDraft[], rate: f64) -> Unit!:
+    # This unit's nodes, by draft index, then put in an order where every
+    # node runs after the nodes it reads.
+    var count: usize = 0
+    for node in drafts:
+        if node.unit == index: count += 1
+    var mine = try new u32[count] in memory.heap
+    defer free(mine) in memory.heap
+    var c: usize = 0
+    for n in 0..<drafts.length:
+        if drafts[n].unit == index:
+            mine[c] = (u32)n
+            c += 1
+    var order = try new u32[count] in memory.heap
+    defer free(order) in memory.heap
+    var placed = try new bool[count] in memory.heap
+    defer free(placed) in memory.heap
+    var at: usize = 0
+    var progress = true
+    while progress:
+        progress = false
+        for k in 0..<count:
+            if placed[k]: continue
+            var ready = true
+            for wire in wires:
+                if wire.unit == index and wire.target == mine[k] and wire.source != mine[k]:
+                    let source = place_of(mine, wire.source)
+                    if source >= 0 and not placed[(usize)source]:
+                        ready = false
+            if ready:
+                order[at] = (u32)k
+                placed[k] = true
+                at += 1
+                progress = true
+    for k in 0..<count:
+        if not placed[k]:
+            order[at] = (u32)k
+            at += 1
+    var instrument = Unit(id = draft.id, track = draft.track, nodes = try new Node[count] --- in arena, voices = try new Voice[(usize)draft.voices] in arena,
+                    to_track = draft.to_track, played = false,
+                    in_left = try new f32[chunk] in arena, in_right = try new f32[chunk] in arena,
+                    out_left = try new f32[chunk] in arena, out_right = try new f32[chunk] in arena,
+                    controls = try new f32[most_controls * chunk] in arena, clock = 0)
+    # Where each node landed, so wires find their slots.
+    var landed = try new i32[count] in memory.heap
+    defer free(landed) in memory.heap
+    for k in 0..<count:
+        landed[(usize)order[k]] = (i32)k
+    var slot: i32 = 0
+    var envelopes: usize = 0
+    for k in 0..<count:
+        let draft_node = drafts[(usize)mine[(usize)order[k]]]
+        var node = Node(id = draft_node.id, kind = draft_node.kind, inputs = [-1, -1, -1, -1, -1, -1, -1, -1], outputs = [-1, -1, -1, -1], target = draft_node.params, value = draft_node.params)
+        for o in 0..<kinds.output_count(draft_node.kind):
+            node.outputs[o] = slot
+            slot += 1
+        if draft_node.kind == kinds.envelope or draft_node.kind == kinds.analog_envelope or draft_node.kind == kinds.fm_operator: envelopes += 1
+        if kinds.rings(draft_node.kind):
+            instrument.rings = true
+            let hold = kinds.ring_hold(draft_node.kind)
+            if hold > instrument.hold: instrument.hold = hold
+        # An instrument (it reads notes) sounds only for notes; an effect always.
+        if draft_node.kind == kinds.note_in: instrument.played = true
+        instrument.nodes[k] = node
+    for wire in wires:
+        if wire.unit != index: continue
+        let source = place_of(mine, wire.source)
+        let target = place_of(mine, wire.target)
+        if source < 0 or target < 0: continue
+        let early = landed[(usize)source]
+        let late = landed[(usize)target]
+        # A wire against the run order (a feedback loop) is dropped.
+        if early >= late: continue
+        let source_kind = instrument.nodes[(usize)early].kind
+        let target_kind = instrument.nodes[(usize)late].kind
+        if (usize)wire.output >= kinds.output_count(source_kind) or (usize)wire.input >= kinds.input_count(target_kind): continue
+        instrument.nodes[(usize)late].inputs[(usize)wire.input] = instrument.nodes[(usize)early].outputs[(usize)wire.output]
+    instrument.envelopes = try new u32[envelopes] in arena
+    var e: usize = 0
+    for k in 0..<count:
+        if instrument.nodes[k].kind == kinds.envelope or instrument.nodes[k].kind == kinds.analog_envelope or instrument.nodes[k].kind == kinds.fm_operator:
+            instrument.envelopes[e] = (u32)k
+            e += 1
+    for v in 0..<instrument.voices.length:
+        var voice = &instrument.voices[v]
+        voice.states = try new State[count] in arena
+        voice.pitch = 0.0
+        voice.velocity = 1.0
+        for k in 0..<count:
+            let node = instrument.nodes[k]
+            voice.states[k].seed = (u32)((((u64)node.id *% 2654435761) ^ ((u64)v *% 40503) ^ 0x5bd1e995) & 0xffffffff) | 1
+            var spread = voice.states[k].seed *% 747796405 +% 2891336453
+            spread ^= spread >> 16
+            voice.states[k].variation = (f32)(spread & 0xffff) / 32767.5 - 1.0
+            let floats = line_floats(node.kind, rate)
+            if floats > 0:
+                voice.states[k].line = try new f32[floats] in arena
+    return instrument
+
+## `node`'s place among `mine`, or -1.
+func place_of(mine: const u32[], node: u32) -> i32:
+    for k in 0..<mine.length:
+        if mine[k] == node: return (i32)k
+    return -1
+
+
+# ---------------------------------------------------------------- carrying state
+
+## Move the running state of `old` into `new`: voices, phases, filters,
+## envelopes, smoothed parameters and lines of every unit and node whose
+## ids match, and the notes each lane has sounding. Realtime safe.
+pub func carry(next: Program*, previous: const Program*):
+    for u in 0..<next.units.length:
+        var instrument = &next.units[u]
+        var found_unit = -1
+        for o in 0..<previous.units.length:
+            if previous.units[o].id == instrument.id:
+                found_unit = (i32)o
+                break
+        if found_unit < 0: continue
+        let before = &previous.units[(usize)found_unit]
+        instrument.clock = before.clock
+        let voices = instrument.voices.length if instrument.voices.length < before.voices.length else before.voices.length
+        for v in 0..<voices:
+            var voice = &instrument.voices[v]
+            let was = &before.voices[v]
+            voice.active = was.active
+            voice.gate = was.gate
+            voice.retrigger = was.retrigger
+            voice.note = was.note
+            voice.pitch = was.pitch
+            voice.velocity = was.velocity
+            voice.pan = was.pan
+            voice.age = was.age
+        for k in 0..<instrument.nodes.length:
+            var node = &instrument.nodes[k]
+            var found = -1
+            for j in 0..<before.nodes.length:
+                if before.nodes[j].id == node.id and before.nodes[j].kind == node.kind:
+                    found = (i32)j
+                    break
+            if found < 0: continue
+            node.value = before.nodes[(usize)found].value
+            for v in 0..<voices:
+                var state = &instrument.voices[v].states[k]
+                let line = state.line
+                *state = before.voices[v].states[(usize)found]
+                state.line = line
+                let old_line = before.voices[v].states[(usize)found].line
+                let shared = line.length if line.length < old_line.length else old_line.length
+                memory.copy(line, old_line, shared)
+    for l in 0..<next.lanes.length:
+        var lane = &next.lanes[l]
+        for o in 0..<previous.lanes.length:
+            if previous.lanes[o].id == lane.id:
+                lane.sounding = previous.lanes[o].sounding
+                lane.count = previous.lanes[o].count
+                break
+
+# ---------------------------------------------------------------- voices
+
+## Start `pitch` on `unit`: a free voice, else the oldest takes it.
+## Start a voice of `unit` playing `pitch`; `written` (the note before a
+## scale moved it, if one did) is what `note_off_written` names it by.
+pub func note_on(instrument: Unit*, pitch: i32, velocity: f32, pan: f32, written: i32 = -1):
+    if instrument.voices.length == 0: return
+    var chosen: usize = 0
+    var found = false
+    for v in 0..<instrument.voices.length:
+        if not instrument.voices[v].active:
+            chosen = v
+            found = true
+            break
+    if not found:
+        var oldest = instrument.voices[0].age
+        for v in 1..<instrument.voices.length:
+            if instrument.voices[v].age < oldest:
+                oldest = instrument.voices[v].age
+                chosen = v
+    instrument.clock += 1
+    var voice = &instrument.voices[chosen]
+    voice.active = true
+    voice.gate = true
+    voice.retrigger = true
+    voice.note = pitch
+    voice.written = pitch if written < 0 else written
+    voice.pitch = (f32)(pitch - 60) / 12.0
+    voice.velocity = velocity
+    voice.pan = pan
+    voice.age = instrument.clock
+
+## Release the voice holding `pitch` on `unit`.
+pub func note_off(instrument: Unit*, pitch: i32):
+    for v in 0..<instrument.voices.length:
+        var voice = &instrument.voices[v]
+        if voice.active and voice.gate and voice.note == pitch:
+            voice.gate = false
+            return
+
+## Release the voice started for written note `written` on `unit`.
+pub func note_off_written(instrument: Unit*, written: i32):
+    for v in 0..<instrument.voices.length:
+        var voice = &instrument.voices[v]
+        if voice.active and voice.gate and voice.written == written:
+            voice.gate = false
+            return
+
+## Release every voice of `unit`.
+pub func release_all(instrument: Unit*):
+    for v in 0..<instrument.voices.length:
+        instrument.voices[v].gate = false
+
+## Silence `unit` at once.
+pub func silence(instrument: Unit*):
+    for v in 0..<instrument.voices.length:
+        instrument.voices[v].gate = false
+        instrument.voices[v].active = false
+
+# ---------------------------------------------------------------- running
+
+## Follow each node's parameters toward where they were set, once a block.
+func smooth(instrument: Unit*):
+    for k in 0..<instrument.nodes.length:
+        var node = &instrument.nodes[k]
+        let count = kinds.param_count(node.kind)
+        for p in 0..<count:
+            let want = node.target[p]
+            let now = node.value[p]
+            if want == now: continue
+            if kinds.param(node.kind, p).items.length > 0:
+                node.value[p] = want
+            else:
+                let next = now + (want - now) * 0.3
+                node.value[p] = want if dsp.absf(want - next) < 0.0000001 * (1.0 + dsp.absf(want)) else next
+
+func span_of(pool: f32[], slot: i32, frames: usize) -> f32[]:
+    let start = (usize)slot * chunk
+    return pool[start..<start + frames]
+
+## Run `unit` for `frames` samples into its outputs.
+pub func run_unit(program: Program*, instrument: Unit*, frames: usize):
+    smooth(instrument)
+    for i in 0..<frames:
+        instrument.out_left[i] = 0.0
+        instrument.out_right[i] = 0.0
+    for v in 0..<instrument.voices.length:
+        var voice = &instrument.voices[v]
+        if instrument.played:
+            if not voice.active: continue
+        else:
+            voice.active = true
+            voice.gate = true
+        run_voice(program, instrument, voice, frames)
+        if instrument.played and not voice.gate:
+            var done = true
+            for e in instrument.envelopes:
+                if voice.states[(usize)e].stage != dsp.idle:
+                    done = false
+            # A ringing patch ends when it has been silent (-80 dB) for its hold,
+            # not at the release.
+            if instrument.rings:
+                if voice.loudness > 0.0001:
+                    voice.quiet = 0.0
+                    done = false
+                else:
+                    voice.quiet += (f32)frames / (f32)program.rate
+                    if voice.quiet < instrument.hold: done = false
+            if done: voice.quiet = 0.0
+            if done: voice.active = false
+
+func run_voice(program: Program*, instrument: Unit*, voice: Voice*, frames: usize):
+    let gates = program.gates
+    let held: f32 = 1.0 if voice.gate else 0.0
+    for i in 0..<frames: gates[i] = held
+    if voice.retrigger:
+        gates[0] = 0.0
+        voice.retrigger = false
+    let zeros = program.zeros[0..<frames]
+    var ports: Ports
+    ports.frames = frames
+    ports.rate = (f32)program.rate
+    ports.gate = gates[0..<frames]
+    ports.beat = program.beat
+    ports.beats_per_sample = program.beats_per_sample
+    ports.scale_root = program.scale.root
+    ports.scale_mask = program.scale.mask
+    for k in 0..<instrument.nodes.length:
+        let node = &instrument.nodes[k]
+        for i in 0..<8:
+            let slot = node.inputs[i]
+            ports.wired[i] = slot >= 0
+            ports.inputs[i] = span_of(program.pool, slot, frames) if slot >= 0 else zeros
+        for i in 0..<4:
+            let out = node.outputs[i]
+            ports.outputs[i] = span_of(program.pool, out, frames) if out >= 0 else program.zeros[0..<0]
+        ports.params = node.value
+        let state = &voice.states[k]
+        let kind = node.kind
+        if kind == kinds.note_in:
+            let pitch = ports.outputs[0]
+            let gate = ports.outputs[1]
+            let velocity = ports.outputs[2]
+            let pan = ports.outputs[3]
+            for i in 0..<frames:
+                pitch[i] = voice.pitch
+                gate[i] = gates[i]
+                velocity[i] = voice.velocity
+                pan[i] = voice.pan
+        elif kind == kinds.control_in:
+            var index = (usize)dsp.clampf(node.value[0] - 1.0, 0.0, 7.0)
+            let source = instrument.controls[index * chunk..<index * chunk + frames]
+            let out = ports.outputs[0]
+            for i in 0..<frames: out[i] = source[i]
+        elif kind == kinds.audio_in:
+            let left = ports.outputs[0]
+            let right = ports.outputs[1]
+            for i in 0..<frames:
+                left[i] = instrument.in_left[i]
+                right[i] = instrument.in_right[i]
+        elif kind == kinds.output:
+            let level = dsp.decibels(node.value[0])
+            let left = ports.inputs[0]
+            let right = ports.inputs[1] if ports.wired[1] else ports.inputs[0]
+            var loud: f32 = 0.0
+            for i in 0..<frames:
+                let l = left[i] * level
+                let r = right[i] * level
+                instrument.out_left[i] += l
+                instrument.out_right[i] += r
+                let a = dsp.absf(l) if dsp.absf(l) > dsp.absf(r) else dsp.absf(r)
+                if a > loud: loud = a
+            voice.loudness = loud
+        elif kind == kinds.oscillator: dsp.oscillator(state, &ports)
+        elif kind == kinds.noise: dsp.noise(state, &ports)
+        elif kind == kinds.filter: dsp.filter(state, &ports)
+        elif kind == kinds.envelope: dsp.envelope(state, &ports)
+        elif kind == kinds.lfo: dsp.lfo(state, &ports)
+        elif kind == kinds.mix: dsp.mix(state, &ports)
+        elif kind == kinds.multiply: dsp.multiply(state, &ports)
+        elif kind == kinds.gain: dsp.gain(state, &ports)
+        elif kind == kinds.pan: dsp.pan(state, &ports)
+        elif kind == kinds.drive: dsp.drive(state, &ports)
+        elif kind == kinds.delay: dsp.delay(state, &ports)
+        elif kind == kinds.constant: dsp.constant(state, &ports)
+        elif kind == kinds.glide: dsp.glide(state, &ports)
+        elif kind == kinds.reverb: dsp.reverb(state, &ports)
+        elif kind == kinds.ladder: models.ladder(state, &ports)
+        elif kind == kinds.sem: models.sem(state, &ports)
+        elif kind == kinds.twin: models.twin(state, &ports)
+        elif kind == kinds.ms20: models.ms20(state, &ports)
+        elif kind == kinds.analog_vco: models.analog_vco(state, &ports)
+        elif kind == kinds.analog_envelope: models.analog_envelope(state, &ports)
+        elif kind == kinds.ota_vca: models.ota_vca(state, &ports)
+        elif kind == kinds.multimode: models.multimode(state, &ports)
+        elif kind == kinds.drive2: models.drive_circuit(state, &ports)
+        elif kind == kinds.kick: models.kick(state, &ports)
+        elif kind == kinds.snare: models.snare(state, &ports)
+        elif kind == kinds.metal: models.metal(state, &ports)
+        elif kind == kinds.clap: models.clap(state, &ports)
+        elif kind == kinds.tine: models.tine(state, &ports)
+        elif kind == kinds.plate: effects.plate(state, &ports)
+        elif kind == kinds.echo: effects.echo(state, &ports)
+        elif kind == kinds.chorus: effects.chorus(state, &ports)
+        elif kind == kinds.compressor: effects.compressor(state, &ports)
+        elif kind == kinds.tremolo: effects.tremolo(state, &ports)
+        elif kind == kinds.diode_ladder: models.diode_ladder(state, &ports)
+        elif kind == kinds.lofi: effects.lofi(state, &ports)
+        elif kind == kinds.phaser: effects.phaser(state, &ports)
+        elif kind == kinds.flanger: effects.flanger(state, &ports)
+        elif kind == kinds.tape: studio.tape(state, &ports)
+        elif kind == kinds.pump: studio.pump(state, &ports)
+        elif kind == kinds.hall: studio.hall(state, &ports)
+        elif kind == kinds.supersaw: studio.supersaw(state, &ports)
+        elif kind == kinds.tempo_lfo: studio.tempo_lfo(state, &ports)
+        elif kind == kinds.width: studio.width(state, &ports)
+        elif kind == kinds.drum_machine: machines.drum_machine(state, &ports)
+        elif kind == kinds.freq_shifter: studio.freq_shifter(state, &ports)
+        elif kind == kinds.eq: mixing.eq(state, &ports)
+        elif kind == kinds.fm_operator: fm.operator(state, &ports)
+        elif kind == kinds.bus_comp: mixing.bus_comp(state, &ports)
+        elif kind == kinds.limiter: mixing.limiter(state, &ports)
+        elif kind == kinds.scale_quantize: scale.quantizer(state, &ports)
+
+## Run every unit of `track` for `frames` samples and sum the ones that
+## play to the track into its bus.
+pub func run_track(program: Program*, track: Track*, frames: usize):
+    program.scale = track_scale(program, track, program.beat)
+    for i in 0..<frames:
+        track.left[i] = 0.0
+        track.right[i] = 0.0
+    # A master with nothing on it passes the mix.
+    if track.master and track.count == 0:
+        for i in 0..<frames:
+            track.left[i] = program.mix_left[i]
+            track.right[i] = program.mix_right[i]
+    let last = track.first + track.count
+    var u = track.first
+    while u < last:
+        var instrument = &program.units[(usize)u]
+        for i in 0..<frames:
+            instrument.in_left[i] = 0.0
+            instrument.in_right[i] = 0.0
+        for source in instrument.sources:
+            let heard = &program.units[(usize)source]
+            for i in 0..<frames:
+                instrument.in_left[i] += heard.out_left[i]
+                instrument.in_right[i] += heard.out_right[i]
+        # The master's first effects hear the mix.
+        if track.master and instrument.sources.length == 0 and not instrument.played:
+            for i in 0..<frames:
+                instrument.in_left[i] += program.mix_left[i]
+                instrument.in_right[i] += program.mix_right[i]
+        run_unit(program, instrument, frames)
+        if instrument.to_track:
+            for i in 0..<frames:
+                track.left[i] += instrument.out_left[i]
+                track.right[i] += instrument.out_right[i]
+        u += 1

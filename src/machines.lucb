@@ -1,0 +1,180 @@
+## The early-80s sample drum machines (LinnDrum, Oberheim DMX, Sequential
+## DrumTraks) that Com Truise and Kavinsky stack. Their sounds were short
+## recordings stored as 8-bit μ-law words (about 12 bits of range), played
+## by a clock per voice — tuning a drum moved its clock, so pitch and length
+## moved together — held between ticks and smoothed by an analog low pass.
+## No samples here: each drum is synthesized at the machine's nominal clock,
+## then goes through that same converter. Sources: reports/Synthwave artist
+## production techniques.md. Nothing here allocates or traps.
+import dsp
+import analog
+import models
+import studio
+from dsp import State, Ports, clampf, absf, exp2, decibels
+
+## The rate the drums are "recorded" at; the Clock param plays them back.
+let recorded: f32 = 27500.0
+
+## e^(-t / tau) for t, tau in seconds.
+inline func fade(t: f32, tau: f32) -> f32:
+    return exp2(-1.442695 * t / tau)
+
+inline func square(phase: f64) -> f32:
+    let t = phase - (f64)(i64)phase
+    return 1.0 if t < 0.5 else -1.0
+
+## A μ-law word of `bits` (μ = 255) and back: fine steps near silence,
+## coarse ones when loud; what the 8-bit converters did to a drum's tail.
+inline func mu_law(x: f32, steps: f32) -> f32:
+    let a = clampf(absf(x), 0.0, 1.0)
+    let coded = studio.log2(1.0 + 255.0 * a) * 0.125
+    let stepped = dsp.floorf(coded * steps + 0.5) / steps
+    let back = (exp2(stepped * 8.0) - 1.0) / 255.0
+    return back if x >= 0.0 else -back
+
+## The 808's six square oscillators (Hz), the source of hats and tambourines.
+let metal_hz: f32[6] = [205.3, 304.4, 369.6, 522.7, 540.0, 800.0]
+
+## A sample drum machine voice. Models: Kick, Snare, Tom, Closed Hat, Open
+## Hat, Clap, Rim, Tambourine, Shaker, Cowbell. Tune moves the voice's
+## clock (pitch and length together, as on a LinnDrum); Bits and Clock are
+## the converter (8 and 27.5 kHz the Linn's; 4 bits and 10 kHz a toy).
+## Inputs: gate, velocity, pitch (octaves).
+## Params: Model, Tune (semitones), Decay, Tone, Bits, Clock (kHz), Level.
+pub func drum_machine(s: State*, p: Ports*):
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let velocity = p.inputs[1]
+    let pitch = p.inputs[2]
+    let out = p.outputs[0]
+    let model = (i32)p.params[0]
+    let tune = clampf(p.params[1], -24.0, 24.0) / 12.0
+    let decay = clampf(p.params[2], 0.1, 4.0)
+    let tone = clampf(p.params[3], 0.0, 1.0)
+    let steps = exp2(clampf(p.params[4], 3.0, 16.0) - 1.0)
+    let clock = clampf(p.params[5], 4.0, 96.0) * 1000.0
+    let level = p.params[6]
+    let dt = 1.0 / recorded
+    # Coefficients at the recorded rate.
+    let hp_hat = analog.one_pole(6500.0 + 2000.0 * tone, recorded)
+    let lp_noise = analog.one_pole(2500.0 + 9000.0 * tone, recorded)
+    let hp_snare = analog.one_pole(900.0, recorded)
+    let hp_clap = analog.one_pole(750.0, recorded)
+    let lp_clap = analog.one_pole(1600.0 + 1500.0 * tone, recorded)
+    let hp_bell = analog.one_pole(420.0, recorded)
+    let lp_bell = analog.one_pole(2600.0, recorded)
+    let fixed_smoothing = analog.one_pole(clampf(clock * exp2(tune) * 0.42, 1000.0, p.rate * 0.45), p.rate)
+    var ticks = (f32)s.a
+    var held = (f32)s.b
+    var accent = (f32)s.c
+    var t = (f32)s.d
+    var word = s.damp[10]
+    var smooth_a = s.damp[8]
+    var smooth_b = s.damp[9]
+    var seed = s.seed
+    for i in 0..<p.frames:
+        if models.struck(gate, i, &held):
+            t = 0.0
+            accent = clampf(velocity[i], 0.0, 1.0) if p.wired[1] else 0.8
+            for k in 0..<6: s.more[k] = 0.0
+            for k in 0..<8: s.damp[k] = 0.0
+        var octaves = tune
+        if p.wired[2]: octaves += pitch[i]
+        let rate = clock * exp2(octaves)
+        ticks += rate / p.rate
+        # One "sample" of the drum per tick of its clock.
+        while ticks >= 1.0:
+            ticks -= 1.0
+            var y: f32 = 0.0
+            if t < 6.0:
+                let noise = dsp.white(&seed)
+                if model == 0:
+                    # Kick: a sine diving from ~125 Hz to 55 Hz, a click.
+                    let f = 55.0 + 70.0 * fade(t, 0.018)
+                    s.more[0] += (f64)(f * dt)
+                    let body = dsp.sin_turns((f32)s.more[0]) * fade(t, 0.26 * decay)
+                    s.damp[0] = s.damp[0] + (noise - s.damp[0]) * lp_noise
+                    y = analog.tanh(1.6 * body + s.damp[0] * fade(t, 0.0025) * (0.5 + tone))
+                elif model == 1:
+                    # Snare: two drumhead modes and a band of noise.
+                    s.more[0] += (f64)(185.0 * dt)
+                    s.more[1] += (f64)(330.0 * dt)
+                    let head = (0.65 * dsp.sin_turns((f32)s.more[0]) + 0.35 * dsp.sin_turns((f32)s.more[1])) * fade(t, 0.055 * decay)
+                    s.damp[0] = s.damp[0] + (noise - s.damp[0]) * lp_noise
+                    s.damp[1] = s.damp[1] + (s.damp[0] - s.damp[1]) * hp_snare
+                    let wires = (s.damp[0] - s.damp[1]) * fade(t, 0.15 * decay)
+                    y = analog.tanh(1.3 * head + 1.6 * wires)
+                elif model == 2:
+                    # Tom: a sine that sags a fifth as it rings.
+                    let f = 110.0 * (1.0 + 0.45 * fade(t, 0.06))
+                    s.more[0] += (f64)(f * dt)
+                    s.damp[0] = s.damp[0] + (noise - s.damp[0]) * lp_noise
+                    y = dsp.sin_turns((f32)s.more[0]) * fade(t, 0.32 * decay) + 0.25 * s.damp[0] * fade(t, 0.008)
+                elif model == 3 or model == 4 or model == 7:
+                    # Hats and tambourine: six squares and noise, high passed.
+                    var metal: f32 = 0.0
+                    let shift: f32 = 1.0 if model != 7 else 2.6
+                    for k in 0..<6:
+                        s.more[k] += (f64)(metal_hz[k] * shift * dt)
+                        metal += square(s.more[k])
+                    let x = metal * 0.12 + noise * 0.5
+                    s.damp[0] = s.damp[0] + (x - s.damp[0]) * hp_hat
+                    s.damp[1] = s.damp[1] + ((x - s.damp[0]) - s.damp[1]) * hp_hat
+                    let bright = (x - s.damp[0]) - s.damp[1]
+                    var env: f32 = 0.0
+                    if model == 3: env = fade(t, 0.035 * decay)
+                    elif model == 4: env = fade(t, 0.38 * decay)
+                    else:
+                        # Two jingles a hand's shake apart.
+                        env = fade(t, 0.09 * decay)
+                        if t > 0.02: env = env + 0.7 * fade(t - 0.02, 0.12 * decay)
+                    y = bright * env * 2.8
+                elif model == 5:
+                    # Clap: four claps 11 ms apart, then the room.
+                    s.damp[0] = s.damp[0] + (noise - s.damp[0]) * lp_clap
+                    s.damp[1] = s.damp[1] + (s.damp[0] - s.damp[1]) * hp_clap
+                    let band = s.damp[0] - s.damp[1]
+                    var env: f32 = 0.0
+                    for k in 0..<4:
+                        let start = 0.011 * (f32)k
+                        if t >= start:
+                            let e = fade(t - start, 0.0045)
+                            if e > env: env = e
+                    if t >= 0.033:
+                        let tail = 0.7 * fade(t - 0.033, 0.12 * decay)
+                        if tail > env: env = tail
+                    y = band * env * 3.0
+                elif model == 6:
+                    # Rim: two short high modes and a click.
+                    s.more[0] += (f64)(500.0 * dt)
+                    s.more[1] += (f64)(1720.0 * dt)
+                    y = (0.7 * dsp.sin_turns((f32)s.more[0]) + 0.5 * dsp.sin_turns((f32)s.more[1])) * fade(t, 0.014 * decay) + noise * fade(t, 0.001)
+                elif model == 8:
+                    # Shaker: noise rising over 12 ms and dying away.
+                    s.damp[0] = s.damp[0] + (noise - s.damp[0]) * hp_hat
+                    let rise = clampf(t / 0.012, 0.0, 1.0)
+                    y = (noise - s.damp[0]) * rise * fade(t, 0.06 * decay) * 1.8
+                else:
+                    # Cowbell: two squares through a band.
+                    s.more[0] += (f64)(562.0 * dt)
+                    s.more[1] += (f64)(845.0 * dt)
+                    let x = square(s.more[0]) + square(s.more[1])
+                    s.damp[0] = s.damp[0] + (x - s.damp[0]) * lp_bell
+                    s.damp[1] = s.damp[1] + (s.damp[0] - s.damp[1]) * hp_bell
+                    let env = 0.6 * fade(t, 0.02) + 0.4 * fade(t, 0.28 * decay)
+                    y = (s.damp[0] - s.damp[1]) * env * 0.5
+                t += dt
+            word = mu_law(y * (0.55 + 0.45 * accent), steps)
+        # The converter's held words through its analog smoothing filter.
+        var smoothing = fixed_smoothing
+        if p.wired[2]: smoothing = analog.one_pole(clampf(rate * 0.42, 1000.0, p.rate * 0.45), p.rate)
+        smooth_a = smooth_a + (word - smooth_a) * smoothing
+        smooth_b = smooth_b + (smooth_a - smooth_b) * smoothing
+        out[i] = smooth_b * level
+    s.a = (f64)ticks
+    s.b = (f64)held
+    s.c = (f64)accent
+    s.d = (f64)t
+    s.damp[10] = word
+    s.damp[8] = smooth_a
+    s.damp[9] = smooth_b
+    s.seed = seed

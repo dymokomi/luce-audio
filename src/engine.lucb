@@ -1,0 +1,1411 @@
+## The engine a song plays through: a program of tracks, units and lanes
+## (`program`), run on the output device's realtime thread or offline, with
+## a transport and a sequencer that start and end notes on the sample.
+##
+## Threads. The main thread builds (`begin` ... `commit`), sends commands
+## (parameters, transport, played notes) through a lock-free ring, and
+## frees programs the audio thread has retired. The audio thread owns the
+## running program and the transport; it publishes position, load and
+## meters through atomics. Nothing the audio thread does allocates, locks,
+## fails or calls into Luce.
+##
+## A new program takes over at the start of a buffer, its running state
+## (voices, phases, filters, envelopes, lines, sounding notes) carried over
+## by id from the one before, so an edit while playing neither clicks nor
+## drops notes.
+import memory
+import atomic
+import strings
+import c
+from luce_std import files
+import time
+import interop
+import result
+import program
+import dsp
+import kinds
+import scale
+from luce_midi import midi
+from scale import Scale, Key
+from luce_midi.midi import Ring as MidiRing, Event as MidiEvent, Input as MidiInput
+from luce_std import wake
+from program import Program, Builder, KeyDraft, ListenDraft, TrackDraft, UnitDraft, NodeDraft, WireDraft, FeedDraft, LaneDraft, NoteDraft, PointDraft, TargetDraft, Note, Point, Lane, Unit, Track
+from device import Device, Block
+from dsp import chunk
+
+pub let most_tracks: usize = 128
+
+let command_param: u32 = 1
+let command_play: u32 = 2
+let command_stop: u32 = 3
+let command_seek: u32 = 4
+let command_tempo: u32 = 5
+let command_loop: u32 = 6
+let command_note_on: u32 = 7
+let command_note_off: u32 = 8
+let command_track: u32 = 9
+let command_master: u32 = 10
+let command_panic: u32 = 11
+let command_metronome: u32 = 12
+
+struct Command:
+    var kind: u32
+    var a: i64
+    var b: i64
+    var c: i64
+    var value: f64
+    var other: f64
+
+let ring_size: u64 = 4096
+
+## What the main and audio threads share. Fields without `@` belong to
+## the audio thread while the device runs, and to the main thread while
+## it does not.
+struct Shared:
+    var pending: @Program*?
+    var retired: @Program*?
+    var current: Program*?
+    var commands: Command[4096]
+    var written: @u64
+    var taken: @u64
+    var rate: f64
+    var playing: bool
+    var beat: f64
+    var tempo: f64
+    var looping: bool
+    var loop_start: f64
+    var loop_end: f64
+    var master: f32
+    var reposition: bool
+    var shown_beat: @u64
+    var shown_playing: @bool
+    var load: @u64
+    var peak_load: @u64
+    var voices: @u32
+    var peaks: (@u32)[128]
+    ## Where tempo-synced kinds are while the transport is stopped.
+    var idle_beat: f64
+    ## The audio thread's side of the MIDI input, while one is open.
+    var midi: @MidiRing*?
+    ## The clock a recording reads (`beat_at`): the beat the block's first
+    ## frame is heard at, that moment in host nanoseconds, and the beats a
+    ## nanosecond; `clock_seq` is odd while the audio thread writes them.
+    var clock_seq: @u64
+    var clock_beat: @u64
+    var clock_nanos: @u64
+    var clock_rate: @u64
+    ## How long after its callback a block is heard, in nanoseconds.
+    var heard_after: u64
+    ## The metronome: on, the beats a bar, and the click sounding.
+    var metronome: bool
+    var click_bar: i64
+    var click_left: f32
+    var click_phase: f32
+    var click_step: f32
+
+# ---------------------------------------------------------------- audio thread
+
+## The device's callback: one hardware buffer.
+func device_render(context: void*?, block: Block*):
+    let raw = context else return
+    let shared = (Shared*)raw
+    let left = block.output(0)
+    let right = block.output(1) if block.channels > 1 else left
+    process(shared, left, right, block.frames, block.host_nanos)
+    for channel in 2..<block.channels:
+        let rest = block.output(channel)
+        for i in 0..<rest.length: rest[i] = 0.0
+
+## Fill `left` and `right` with the next `frames` samples.
+func process(shared: Shared*, left: f32[], right: f32[], frames: usize, host: u64 = 0):
+    let started = time.now()
+    take_program(shared)
+    drain(shared)
+    publish_clock(shared, host)
+    if let running = shared.current:
+        take_midi(shared, running)
+    if shared.current == none:
+        for i in 0..<frames:
+            left[i] = 0.0
+            right[i] = 0.0
+        return
+    let running = shared.current else return
+    var done: usize = 0
+    var sounding: u32 = 0
+    while done < frames:
+        var n = frames - done
+        if n > chunk: n = chunk
+        let per_sample = shared.tempo / 60.0 / shared.rate
+        if shared.playing:
+            if shared.reposition:
+                reposition(running, shared.beat, per_sample)
+                shared.reposition = false
+            fire(running, shared.beat, per_sample)
+            let next = next_event(running, shared, per_sample)
+            if next < 1.0e300:
+                let until = (next - shared.beat) / per_sample
+                if until < (f64)n:
+                    var whole = (usize)until
+                    if (f64)whole < until: whole += 1
+                    if whole < 1: whole = 1
+                    if whole < n: n = whole
+        let span = per_sample * (f64)n if shared.playing else 0.0
+        curves(running, shared.beat, shared.beat + span, n)
+        running.beat = shared.beat if shared.playing else shared.idle_beat
+        running.beats_per_sample = per_sample
+        shared.idle_beat = shared.beat + span if shared.playing else shared.idle_beat + per_sample * (f64)n
+        var l = left[done..<done + n]
+        var r = right[done..<done + n]
+        for i in 0..<n:
+            l[i] = 0.0
+            r[i] = 0.0
+        for t in 0..<running.tracks.length:
+            var track = &running.tracks[t]
+            if track.master: continue
+            program.run_track(running, track, n)
+            mix_track(shared, running, track, t, l, r, n)
+        if running.master >= 0:
+            # The mix through the master's chain becomes the output.
+            for i in 0..<n:
+                running.mix_left[i] = l[i]
+                running.mix_right[i] = r[i]
+                l[i] = 0.0
+                r[i] = 0.0
+            let m = (usize)running.master
+            var bus = &running.tracks[m]
+            program.run_track(running, bus, n)
+            mix_track(shared, running, bus, m, l, r, n)
+        let master = shared.master
+        for i in 0..<n:
+            l[i] = l[i] * master
+            r[i] = r[i] * master
+        if shared.metronome and shared.playing:
+            click(shared, l, r, n, per_sample)
+        for i in 0..<n:
+            l[i] = safety(l[i])
+            r[i] = safety(r[i])
+        if shared.playing:
+            shared.beat += span
+            if shared.looping and shared.loop_end > shared.loop_start and shared.beat >= shared.loop_end - per_sample * 0.5:
+                end_all(running)
+                shared.beat = shared.loop_start + (shared.beat - shared.loop_end)
+                if shared.beat < shared.loop_start: shared.beat = shared.loop_start
+                reposition(running, shared.beat, per_sample)
+        done += n
+    for instrument in running.units:
+        for voice in instrument.voices:
+            if voice.active and instrument.played: sounding += 1
+    shared.voices.store(sounding, .relaxed)
+    shared.shown_beat.store(shared.beat.bits(), .relaxed)
+    shared.shown_playing.store(shared.playing, .relaxed)
+    let budget = (f64)frames / shared.rate * 1000000000.0
+    let busy = (f64)time.since(started) / budget
+    shared.load.store(busy.bits(), .relaxed)
+    if busy > f64.bits(shared.peak_load.load(.relaxed)):
+        shared.peak_load.store(busy.bits(), .relaxed)
+
+## Say where the transport is for `beat_at`: the block about to play is
+## heard `heard_after` its callback's host time.
+func publish_clock(shared: Shared*, host: u64):
+    if host == 0: return
+    let seq = shared.clock_seq.load(.relaxed)
+    shared.clock_seq.store(seq +% 1, .release)
+    let beat = shared.beat if shared.playing else shared.idle_beat
+    let rate = shared.tempo / 60.0 / 1000000000.0 if shared.playing else 0.0
+    shared.clock_beat.store(beat.bits(), .relaxed)
+    shared.clock_nanos.store(host + shared.heard_after, .relaxed)
+    shared.clock_rate.store(rate.bits(), .relaxed)
+    shared.clock_seq.store(seq +% 2, .release)
+
+## Play the MIDI that came in since the last block on the tracks hearing it.
+func take_midi(shared: Shared*, running: Program*):
+    let ring = shared.midi.load(.acquire) else return
+    var event: MidiEvent
+    while ring.next(&event):
+        route_midi(shared, running, event)
+
+## One MIDI message to every track listening for its source and channel:
+## notes through the track's scale, all-notes-off releasing them.
+func route_midi(shared: Shared*, running: Program*, event: MidiEvent):
+    let kind = event.status & 0xF0
+    if kind != 0x80 and kind != 0x90 and kind != 0xB0: return
+    let channel = (i32)(event.status & 0x0F) + 1
+    let beat = shared.beat if shared.playing else 0.0
+    for t in 0..<running.tracks.length:
+        let track = &running.tracks[t]
+        if track.listens.length == 0 or track.midi_source < 0: continue
+        if track.midi_source != 0 and track.midi_source != (i64)event.source: continue
+        if track.midi_channel != 0 and track.midi_channel != channel: continue
+        let written = (i32)event.data1
+        if kind == 0x90 and event.data2 > 0:
+            let pitch = scale.quantize(written, program.track_scale(running, track, beat))
+            for u in track.listens:
+                program.note_on(&running.units[(usize)u], pitch, (f32)event.data2 / 127.0, 0.0, written = written)
+        elif kind == 0x80 or kind == 0x90:
+            for u in track.listens:
+                program.note_off_written(&running.units[(usize)u], written)
+        elif event.data1 == 120 or event.data1 == 123:
+            for u in track.listens:
+                program.release_all(&running.units[(usize)u])
+
+## The metronome's click into `n` samples: a short high blip on each bar's
+## first beat, a lower one on the others.
+func click(shared: Shared*, l: f32[], r: f32[], n: usize, per_sample: f64):
+    for i in 0..<n:
+        let beat = shared.beat + per_sample * (f64)i
+        let whole = (f64)(i64)beat - (1.0 if beat < 0.0 and (f64)(i64)beat != beat else 0.0)
+        if beat - per_sample < whole and beat >= whole:
+            let bar = shared.click_bar if shared.click_bar > 0 else 4
+            let first = (i64)whole % bar == 0
+            shared.click_step = (f32)((1600.0 if first else 1000.0) / shared.rate)
+            shared.click_left = (f32)(0.03 * shared.rate)
+            shared.click_phase = 0.0
+        if shared.click_left > 0.0:
+            let fade = shared.click_left / (f32)(0.03 * shared.rate)
+            let y = 0.3 * dsp.sin_turns(shared.click_phase) * fade * fade
+            shared.click_phase += shared.click_step
+            shared.click_left -= 1.0
+            l[i] += y
+            r[i] += y
+
+## Take a pending program, carrying the running state into it, when the
+## main thread has collected the last one retired.
+func take_program(shared: Shared*):
+    if shared.retired.load(.acquire) != none:
+        return
+    let next = shared.pending.swap(none, .acq_rel) else return
+    if let old = shared.current:
+        program.carry(next, old)
+        shared.retired.store(old, .release)
+    shared.current = next
+    shared.reposition = true
+
+func drain(shared: Shared*):
+    let written = shared.written.load(.acquire)
+    var taken = shared.taken.load(.relaxed)
+    while taken != written:
+        let command = shared.commands[(usize)(taken % ring_size)]
+        apply(shared, command)
+        taken +%= 1
+    shared.taken.store(taken, .release)
+
+func unit_of(running: Program*, id: i64) -> Unit*?:
+    for u in 0..<running.units.length:
+        if running.units[u].id == id: return &running.units[u]
+    return none
+
+func apply(shared: Shared*, command: Command):
+    let kind = command.kind
+    if kind == command_play:
+        if not shared.playing:
+            shared.playing = true
+            shared.reposition = true
+    elif kind == command_stop:
+        shared.playing = false
+        if let running = shared.current: end_all(running)
+    elif kind == command_seek:
+        shared.beat = command.value if command.value > 0.0 else 0.0
+        if let running = shared.current: end_all(running)
+        shared.reposition = true
+    elif kind == command_tempo:
+        shared.tempo = dsp_clamp(command.value, 10.0, 999.0)
+    elif kind == command_loop:
+        shared.looping = command.a != 0
+        shared.loop_start = command.value
+        shared.loop_end = command.other
+    elif kind == command_master:
+        shared.master = (f32)command.value
+    elif kind == command_metronome:
+        shared.metronome = command.a != 0
+        shared.click_bar = command.b
+    else:
+        let running = shared.current else return
+        if kind == command_param:
+            let instrument = unit_of(running, command.a) else return
+            for k in 0..<instrument.nodes.length:
+                if instrument.nodes[k].id == command.b and command.c >= 0 and command.c < 16:
+                    instrument.nodes[k].target[(usize)command.c] = (f32)command.value
+        elif kind == command_note_on:
+            let instrument = unit_of(running, command.a) else return
+            instrument.played = true
+            # A key plays the note its track's scale gives now.
+            let beat = shared.beat if shared.playing else 0.0
+            let pitch = scale.quantize((i32)command.b, program.track_scale(running, &running.tracks[(usize)instrument.track], beat))
+            program.note_on(instrument, pitch, (f32)command.value, 0.0, written = (i32)command.b)
+        elif kind == command_note_off:
+            let instrument = unit_of(running, command.a) else return
+            program.note_off_written(instrument, (i32)command.b)
+        elif kind == command_track:
+            for t in 0..<running.tracks.length:
+                var track = &running.tracks[t]
+                if track.id == command.a:
+                    track.volume = (f32)command.value
+                    track.pan = (f32)command.other
+                    track.mute = (command.b & 1) != 0
+                    track.solo = (command.b & 2) != 0
+            running.any_solo = false
+            for track in running.tracks:
+                if track.solo: running.any_solo = true
+        elif kind == command_panic:
+            for u in 0..<running.units.length:
+                program.silence(&running.units[u])
+            for l in 0..<running.lanes.length:
+                running.lanes[l].count = 0
+
+## The master's last stage: linear to 0.92 (-0.7 dBFS, so a master limited
+## to -1 dBTP passes untouched), then bending smoothly toward full scale, so
+## an overloaded mix rounds off instead of clipping.
+inline func safety(x: f32) -> f32:
+    let size = dsp.absf(x)
+    if size <= 0.92:
+        return x
+    let bent = 0.92 + 0.08 * dsp.soft_clip((size - 0.92) * 12.5)
+    return bent if x > 0.0 else -bent
+
+func dsp_clamp(x: f64, low: f64, high: f64) -> f64:
+    if x < low: return low
+    if x > high: return high
+    return x
+
+## Release every sounding note of every lane.
+func end_all(running: Program*):
+    for l in 0..<running.lanes.length:
+        var lane = &running.lanes[l]
+        for s in 0..<lane.count:
+            for target in lane.targets:
+                program.note_off(&running.units[(usize)target], lane.sounding[s].pitch)
+        lane.count = 0
+
+## Put each lane's cursor at the first note starting at or after `beat`.
+func reposition(running: Program*, beat: f64, per_sample: f64):
+    let early = beat - per_sample * 0.5
+    for l in 0..<running.lanes.length:
+        var lane = &running.lanes[l]
+        var low: usize = 0
+        var high = lane.notes.length
+        while low < high:
+            let middle = low + (high - low) // 2
+            if lane.notes[middle].start < early:
+                low = middle + 1
+            else:
+                high = middle
+        lane.cursor = low
+
+## End the notes due by `beat`, then start the ones due.
+func fire(running: Program*, beat: f64, per_sample: f64):
+    let due = beat + per_sample * 0.5
+    for l in 0..<running.lanes.length:
+        var lane = &running.lanes[l]
+        if lane.curve: continue
+        var s: usize = 0
+        while s < lane.count:
+            if lane.sounding[s].end <= due:
+                for target in lane.targets:
+                    program.note_off(&running.units[(usize)target], lane.sounding[s].pitch)
+                lane.count -= 1
+                lane.sounding[s] = lane.sounding[lane.count]
+            else:
+                s += 1
+        while lane.cursor < lane.notes.length and lane.notes[lane.cursor].start <= due:
+            let written = lane.notes[lane.cursor]
+            lane.cursor += 1
+            if written.end <= due: continue
+            # The note the track's scale gives, where it starts.
+            var note = written
+            note.pitch = scale.quantize(written.pitch, program.track_scale(running, &running.tracks[(usize)lane.track], written.start))
+            # The same pitch sounding again ends first, as a keyboard would.
+            var k: usize = 0
+            while k < lane.count:
+                if lane.sounding[k].pitch == note.pitch:
+                    for target in lane.targets:
+                        program.note_off(&running.units[(usize)target], note.pitch)
+                    lane.count -= 1
+                    lane.sounding[k] = lane.sounding[lane.count]
+                else:
+                    k += 1
+            for target in lane.targets:
+                program.note_on(&running.units[(usize)target], note.pitch, note.velocity, note.pan)
+            if lane.count < program.most_sounding:
+                lane.sounding[lane.count] = program.Sounding(pitch = note.pitch, end = note.end)
+                lane.count += 1
+
+## The beat of the next note start or end, or the loop's end.
+func next_event(running: Program*, shared: Shared*, per_sample: f64) -> f64:
+    var next = 1.0e301
+    let after = shared.beat + per_sample * 0.5
+    for lane in running.lanes:
+        if lane.curve: continue
+        if lane.cursor < lane.notes.length:
+            let start = lane.notes[lane.cursor].start
+            if start > after and start < next: next = start
+        for s in 0..<lane.count:
+            let end = lane.sounding[s].end
+            if end > after and end < next: next = end
+    if shared.looping and shared.loop_end > shared.loop_start and shared.loop_end > after and shared.loop_end < next:
+        next = shared.loop_end
+    return next
+
+## A curve lane's value at `beat`.
+pub func curve_at(lane: const Lane*, beat: f64) -> f32:
+    let points = lane.points
+    if points.length == 0: return 0.0
+    if beat <= points[0].beat: return points[0].value
+    let last = points[points.length - 1]
+    if beat >= last.beat: return last.value
+    var low: usize = 0
+    var high = points.length - 1
+    while high - low > 1:
+        let middle = low + (high - low) // 2
+        if points[middle].beat <= beat: low = middle
+        else: high = middle
+    let a = points[low]
+    let b = points[high]
+    if a.shape == 1 or b.beat <= a.beat: return a.value
+    let t = (f32)((beat - a.beat) / (b.beat - a.beat))
+    return a.value + (b.value - a.value) * t
+
+## Fill the controls curve lanes drive for the block from beat `first` to `last`.
+func curves(running: Program*, first: f64, last: f64, frames: usize):
+    for u in 0..<running.units.length:
+        let controls = running.units[u].controls
+        for i in 0..<controls.length: controls[i] = 0.0
+    for l in 0..<running.lanes.length:
+        let lane = &running.lanes[l]
+        if not lane.curve or lane.unit < 0: continue
+        let instrument = &running.units[(usize)lane.unit]
+        let control = (usize)lane.control
+        if control >= program.most_controls: continue
+        let a = curve_at(lane, first)
+        let b = curve_at(lane, last)
+        let step = (b - a) / (f32)frames
+        let values = instrument.controls[control * chunk..<control * chunk + frames]
+        for i in 0..<frames:
+            values[i] += a + step * (f32)i
+
+## Add `track`'s bus to the master at its volume and pan, and meter it.
+func mix_track(shared: Shared*, running: Program*, track: Track*, index: usize, left: f32[], right: f32[], frames: usize):
+    if track.mute or (running.any_solo and not track.solo and not track.master):
+        return
+    var volume = track.volume
+    if track.volume_curve >= 0: volume = curve_at(&running.lanes[(usize)track.volume_curve], shared.beat)
+    var pan = track.pan
+    if track.pan_curve >= 0: pan = curve_at(&running.lanes[(usize)track.pan_curve], shared.beat)
+    pan = dsp.clampf(pan, -1.0, 1.0)
+    var lg: f32 = 1.0
+    var rg: f32 = 1.0
+    if track.channels == 1:
+        lg = dsp.sin_turns((1.0 - pan) * 0.125)
+        rg = dsp.sin_turns((1.0 + pan) * 0.125)
+    else:
+        if pan > 0.0: lg = 1.0 - pan
+        if pan < 0.0: rg = 1.0 + pan
+    lg *= volume
+    rg *= volume
+    var peak: f32 = 0.0
+    for i in 0..<frames:
+        var l = track.left[i]
+        var r = track.right[i]
+        if track.channels == 1:
+            let m = (l + r) * 0.5
+            l = m
+            r = m
+        l *= lg
+        r *= rg
+        left[i] += l
+        right[i] += r
+        let a = dsp.absf(l)
+        let b = dsp.absf(r)
+        if a > peak: peak = a
+        if b > peak: peak = b
+    if index < most_tracks:
+        _ = shared.peaks[index].max(peak.bits(), .relaxed)
+
+# ---------------------------------------------------------------- the main thread
+
+## The engine, as an application holds it.
+pub struct Engine:
+    var shared: Shared*?
+    var output: Device?
+    var midi_input: MidiInput?
+    ## The last message `midi_next` took from the input's main ring.
+    var last_midi: MidiEvent
+    ## The sources as `midi_refresh` last read them.
+    var sources: midi.Endpoint[32]
+    var source_count: usize
+    var builder: Builder
+    var left: f32[]
+    var right: f32[]
+    var rendered: usize
+
+    ## Stop sound and free everything.
+    pub func close():
+        self.stop_output()
+        self.close_midi()
+        if let shared = self.shared:
+            if let p = shared.pending.swap(none, .acq_rel): program.destroy(p)
+            if let p = shared.retired.swap(none, .acq_rel): program.destroy(p)
+            if let p = shared.current: program.destroy(p)
+            free(shared) in memory.heap
+        self.shared = none
+        self.builder.destroy()
+        if self.left.length > 0: free(self.left) in memory.heap
+        if self.right.length > 0: free(self.right) in memory.heap
+        self.left = self.left[0..<0]
+        self.right = self.right[0..<0]
+
+    func link() -> Shared*:
+        return self.shared else trap("the engine is closed")
+
+    # ------------------------------------------------ building
+
+    ## Start describing a new program; `commit` makes it play.
+    pub func begin():
+        self.builder.clear()
+
+    ## A track; answers its index for `add_unit` and `add_lane`. `volume`
+    ## is a gain (1 is unity), `pan` -1..1, `channels` 1 or 2.
+    ## A `master` track hears every other track's mix through its effects
+    ## (Audio In) and gives the song's output: the mastering chain.
+    ## `keyed` is how its notes take a scale: 0 as written, 1 the song's
+    ## keys, 2 its own keys (`add_key`).
+    ## `midi_in` is the MIDI it plays live (-1 none, 0 every source, else a
+    ## source's id, `midi_sources`) on `channel` (0 any, 1..16), into the
+    ## units `listen` names.
+    pub func add_track(id: i64, channels: i64, volume: f64, pan: f64, mute: bool, solo: bool, master: bool = false, keyed: i64 = 1, midi_in: i64 = -1, channel: i64 = 0) -> i64!:
+        try self.builder.tracks.append(TrackDraft(id = id, channels = (u32)channels, volume = (f32)volume, pan = (f32)pan, mute = mute, solo = solo, master = master, scale_mode = (u32)keyed,
+                                                  midi_source = midi_in, midi_channel = (i32)channel))
+        return (i64)self.builder.tracks.length() - 1
+
+    ## An instrument or effect on `track` with `voices` voices (1 to 32);
+    ## `to_track` sends its output to the track's bus.
+    pub func add_unit(track: i64, id: i64, voices: i64, to_track: bool) -> i64!:
+        if track < 0 or voices < 1 or voices > (i64)program.most_voices:
+            error(result.invalid, "a unit has a track and 1 to 32 voices")
+        try self.builder.units.append(UnitDraft(id = id, track = (u32)track, voices = (u32)voices, to_track = to_track))
+        return (i64)self.builder.units.length() - 1
+
+    ## A node of `kind` in `unit`'s patch, its parameters at their defaults.
+    pub func add_node(instrument: i64, id: i64, kind: i64) -> i64!:
+        if instrument < 0 or kind < 0 or kind >= (i64)kinds.count:
+            error(result.invalid, "a node has a unit and a known kind")
+        var params: f32[16]
+        for p in 0..<kinds.param_count((u32)kind):
+            params[p] = (f32)kinds.param((u32)kind, p).initial
+        try self.builder.nodes.append(NodeDraft(unit = (u32)instrument, id = id, kind = (u32)kind, params = params))
+        return (i64)self.builder.nodes.length() - 1
+
+    ## Set parameter `slot` of node `node` (as `add_node` answered).
+    pub func node_param(node: i64, slot: i64, value: f64):
+        if node < 0 or node >= (i64)self.builder.nodes.length() or slot < 0 or slot >= 16:
+            return
+        var draft = self.builder.nodes.at((usize)node)
+        draft.params[(usize)slot] = (f32)value
+        self.builder.nodes.set((usize)node, draft)
+
+    ## Wire output `output` of node `source` to input `input` of node
+    ## `target` (both as `add_node` answered, in one unit).
+    pub func wire(source: i64, output: i64, target: i64, input: i64) -> !:
+        let count = (i64)self.builder.nodes.length()
+        if source < 0 or target < 0 or source >= count or target >= count or output < 0 or input < 0:
+            error(result.invalid, "a wire joins two nodes")
+        let instrument = self.builder.nodes.at((usize)source).unit
+        if self.builder.nodes.at((usize)target).unit != instrument:
+            error(result.invalid, "a wire joins two nodes of one unit")
+        try self.builder.wires.append(WireDraft(unit = instrument, source = (u32)source, output = (u32)output, target = (u32)target, input = (u32)input))
+
+    ## `unit` hears `source`'s output at its Audio In.
+    pub func feed(instrument: i64, source: i64) -> !:
+        if instrument < 0 or source < 0:
+            error(result.invalid, "a feed joins two units")
+        try self.builder.feeds.append(FeedDraft(unit = (u32)instrument, source = (u32)source))
+
+    ## A lane on `track` of notes, or with `curve` of curve points.
+    pub func add_lane(track: i64, id: i64, curve: bool) -> i64!:
+        if track < 0:
+            error(result.invalid, "a lane has a track")
+        try self.builder.lanes.append(LaneDraft(id = id, track = (u32)track, curve = curve, unit = -1, control = 0))
+        return (i64)self.builder.lanes.length() - 1
+
+    ## Note lane `lane` plays `unit`.
+    pub func play_notes(lane: i64, instrument: i64) -> !:
+        if lane < 0 or instrument < 0:
+            error(result.invalid, "a lane plays a unit")
+        try self.builder.targets.append(TargetDraft(lane = (u32)lane, unit = (u32)instrument))
+
+    ## Curve lane `lane` drives control `control` (0..7) of `unit`, or with
+    ## `unit` -1 its track's volume (control 0) or pan (control 1).
+    pub func drive(lane: i64, instrument: i64, control: i64):
+        if lane < 0 or lane >= (i64)self.builder.lanes.length():
+            return
+        var draft = self.builder.lanes.at((usize)lane)
+        draft.unit = (i32)instrument
+        draft.control = (u32)control
+        self.builder.lanes.set((usize)lane, draft)
+
+    ## A note in `lane`, `start` and `length` in beats.
+    pub func add_note(lane: i64, start: f64, length: f64, pitch: i64, velocity: f64, pan: f64) -> !:
+        if lane < 0 or length <= 0.0 or pitch < 0 or pitch > 127:
+            error(result.invalid, "a note has a lane, a length and a pitch 0..127")
+        try self.builder.notes.append(NoteDraft(lane = (u32)lane, note = Note(start = start, end = start + length, pitch = (i32)pitch, velocity = (f32)velocity, pan = (f32)pan)))
+
+    ## A curve point in `lane`; `shape` 0 ramps to the next point, 1 holds.
+    pub func add_point(lane: i64, beat: f64, value: f64, shape: i64) -> !:
+        if lane < 0:
+            error(result.invalid, "a point has a lane")
+        try self.builder.points.append(PointDraft(lane = (u32)lane, point = Point(beat = beat, value = (f32)value, shape = (u32)shape)))
+
+    ## Track `track` plays unit `unit` from the MIDI it hears.
+    pub func listen(track: i64, instrument: i64) -> !:
+        if track < 0 or instrument < 0:
+            error(result.invalid, "a track listens with a unit")
+        try self.builder.listens.append(ListenDraft(track = (u32)track, unit = (u32)instrument))
+
+    ## A scale key: from `beat` on, `track`'s notes (with track -1, the
+    ## song's: every track following it) take mode `mode` (`scale_modes`)
+    ## on `root` 0..11 (C..B), until the next key.
+    pub func add_key(track: i64, beat: f64, root: i64, mode: i64) -> !:
+        if root < 0 or root > 11:
+            error(result.invalid, "a key's root is 0..11")
+        try self.builder.keys.append(KeyDraft(track = (i32)track, key = Key(beat = beat, scale = Scale(root = (i32)root, mask = scale.mode_mask(mode)))))
+
+    ## Compile what was described since `begin` and hand it to the audio.
+    pub func commit() -> !:
+        let shared = self.link()
+        let made = try program.compile(&self.builder, shared.rate)
+        if let old = shared.pending.swap(made, .acq_rel):
+            program.destroy(old)
+        self.poll()
+
+    # ------------------------------------------------ playing
+
+    func send(command: Command):
+        let shared = self.link()
+        let written = shared.written.load(.relaxed)
+        if written -% shared.taken.load(.acquire) >= ring_size:
+            # The audio thread has fallen behind by a whole ring: drop it.
+            return
+        shared.commands[(usize)(written % ring_size)] = command
+        shared.written.store(written +% 1, .release)
+        if self.output == none:
+            self.poll()
+
+    func message(kind: u32, a: i64 = 0, b: i64 = 0, third: i64 = 0, value: f64 = 0.0, other: f64 = 0.0):
+        self.send(Command(kind = kind, a = a, b = b, c = third, value = value, other = other))
+
+    ## Set parameter `slot` of node `node` of unit `unit` (by their ids) while playing.
+    pub func set_param(instrument: i64, node: i64, slot: i64, value: f64):
+        self.message(command_param, instrument, node, slot, value)
+
+    pub func play():
+        self.message(command_play)
+
+    pub func stop():
+        self.message(command_stop)
+
+    pub func seek(beat: f64):
+        self.message(command_seek, value = beat)
+
+    pub func set_tempo(bpm: f64):
+        self.message(command_tempo, value = bpm)
+
+    pub func set_loop(on: bool, start: f64, end: f64):
+        self.message(command_loop, 1 if on else 0, value = start, other = end)
+
+    pub func set_master(gain: f64):
+        self.message(command_master, value = gain)
+
+    ## The metronome on or off, counting `beats_per_bar` to a bar.
+    pub func set_metronome(on: bool, beats_per_bar: i64):
+        self.message(command_metronome, 1 if on else 0, beats_per_bar)
+
+    # ------------------------------------------------ MIDI
+
+    ## Listen to every MIDI source. `waker` is woken (on any thread) when
+    ## messages wait in `midi_next` or the sources change.
+    pub func open_midi(waker: interop.Reference[wake.Waker]? = none) -> !:
+        if self.midi_input != none: return
+        var input = try MidiInput.open(waker = waker, name = "Luced Music")
+        self.midi_input = input
+        let shared = self.link()
+        shared.midi.store(input.audio(), .release)
+
+    ## Close the MIDI input; the device is stopped first (`close`), so no
+    ## block still holds its ring.
+    func close_midi():
+        if let input = self.midi_input:
+            var held = input
+            let shared = self.link()
+            shared.midi.store(none, .release)
+            held.close()
+        self.midi_input = none
+
+    ## Take the next MIDI message for the main thread (recording, a light),
+    ## then read it with `midi_status` and the rest. False when none waits.
+    pub func midi_next() -> bool:
+        let input = self.midi_input else return false
+        let ring = input.main() else return false
+        return ring.next(&self.last_midi)
+
+    pub func midi_status() -> i64:
+        return (i64)self.last_midi.status
+
+    pub func midi_data1() -> i64:
+        return (i64)self.last_midi.data1
+
+    pub func midi_data2() -> i64:
+        return (i64)self.last_midi.data2
+
+    pub func midi_source() -> i64:
+        return (i64)self.last_midi.source
+
+    ## When the last message arrived, in host nanoseconds (as `beat_at` takes).
+    pub func midi_nanos() -> i64:
+        return (i64)self.last_midi.nanos
+
+    ## Read the MIDI sources as they are now, for `midi_source_id` and
+    ## `midi_source_name`; answers how many there are.
+    pub func midi_refresh() -> i64:
+        self.source_count = midi.sources(self.sources)
+        return (i64)self.source_count
+
+    ## Source `index`'s unique id (what `add_track`'s `midi` names), as of
+    ## the last `midi_refresh`.
+    pub func midi_source_id(index: i64) -> i64:
+        if index < 0 or (usize)index >= self.source_count: return -1
+        return (i64)self.sources[(usize)index].id
+
+    pub func midi_source_name(index: i64) -> str:
+        if index < 0 or (usize)index >= self.source_count: return ""
+        return self.sources[(usize)index].name()
+
+    ## Bumped whenever MIDI sources come or go.
+    pub func midi_generation() -> i64:
+        let input = self.midi_input else return 0
+        return (i64)input.generation()
+
+    ## The beat heard at host time `nanos` (`midi_nanos`), from the clock the
+    ## device's last block set; the transport's beat without a device.
+    pub func beat_at(nanos: i64) -> f64:
+        let shared = self.link()
+        if self.output == none: return shared.beat
+        var tries = 0
+        while tries < 8:
+            let before = shared.clock_seq.load(.acquire)
+            let beat = f64.bits(shared.clock_beat.load(.relaxed))
+            let at = shared.clock_nanos.load(.relaxed)
+            let rate = f64.bits(shared.clock_rate.load(.relaxed))
+            if before % 2 == 0 and shared.clock_seq.load(.acquire) == before:
+                return beat + ((f64)nanos - (f64)at) * rate
+            tries += 1
+        return f64.bits(shared.clock_beat.load(.relaxed))
+
+    ## Now on the clock `beat_at` and `midi_nanos` use.
+    pub func now_nanos() -> i64:
+        return (i64)midi.now_nanos()
+
+    ## A track's live mix settings, by its id.
+    pub func set_track(id: i64, volume: f64, pan: f64, mute: bool, solo: bool):
+        self.message(command_track, id, (1 if mute else 0) | (2 if solo else 0), value = volume, other = pan)
+
+    ## Play `pitch` on unit `unit` (by id) now, as a keyboard does.
+    pub func note_on(instrument: i64, pitch: i64, velocity: f64):
+        self.message(command_note_on, instrument, pitch, value = velocity)
+
+    pub func note_off(instrument: i64, pitch: i64):
+        self.message(command_note_off, instrument, pitch)
+
+    ## Silence everything at once.
+    pub func panic():
+        self.message(command_panic)
+
+    # ------------------------------------------------ what it is doing
+
+    ## Where the transport is, in beats.
+    pub func position() -> f64:
+        return f64.bits(self.link().shown_beat.load(.relaxed))
+
+    pub func is_playing() -> bool:
+        return self.link().shown_playing.load(.relaxed)
+
+    ## The loudest sample track `index` (in commit order) played since the
+    ## last call.
+    pub func peak(index: i64) -> f64:
+        if index < 0 or index >= (i64)most_tracks: return 0.0
+        return (f64)f32.bits(self.link().peaks[(usize)index].swap(0, .relaxed))
+
+    ## The last buffer's processing time as a share of its duration, and
+    ## the largest since the last call.
+    pub func load() -> f64:
+        return f64.bits(self.link().load.load(.relaxed))
+
+    pub func peak_load() -> f64:
+        return f64.bits(self.link().peak_load.swap(0, .relaxed))
+
+    pub func sounding_voices() -> i64:
+        return (i64)self.link().voices.load(.relaxed)
+
+    pub func sample_rate() -> f64:
+        return self.link().rate
+
+    ## Free what the audio thread has retired; with no device running, also
+    ## take a pending program and commands, as the audio thread would.
+    pub func poll():
+        let shared = self.link()
+        if let old = shared.retired.swap(none, .acq_rel):
+            program.destroy(old)
+        if self.output == none:
+            take_program(shared)
+            drain(shared)
+            if let old = shared.retired.swap(none, .acq_rel):
+                program.destroy(old)
+
+    ## Whether the audio thread has yet to act on what was sent it: a command it
+    ## hasn't read, a program waiting for it, or one it retired that `poll` has
+    ## yet to free. The UI polls again while this holds, and sleeps once it
+    ## settles.
+    pub func settling() -> bool:
+        let shared = self.link()
+        if shared.written.load(.acquire) != shared.taken.load(.acquire): return true
+        return shared.pending.load(.acquire) != none or shared.retired.load(.acquire) != none
+
+    # ------------------------------------------------ the device
+
+    ## Play through the default output device, asking for `frames` per buffer.
+    pub func start_output(frames: i64 = 64) -> !:
+        if self.output != none: return
+        let shared = self.link()
+        self.poll()
+        var made = try Device.open(device_render, (void*)shared, frames = (u32)frames, channels = 2)
+        errdefer made.close()
+        if made.sample_rate != shared.rate and made.sample_rate > 0.0:
+            shared.rate = made.sample_rate
+            if shared.current != none or shared.pending.load(.acquire) != none:
+                let again = try program.compile(&self.builder, shared.rate)
+                if let old = shared.pending.swap(again, .acq_rel): program.destroy(old)
+        shared.heard_after = (u64)((f64)(made.output_latency + made.buffer_frames) / made.sample_rate * 1000000000.0) if made.sample_rate > 0.0 else 0
+        try made.start()
+        self.output = made
+
+    pub func stop_output():
+        if let running = self.output:
+            var made = running
+            made.stop()
+            made.close()
+        self.output = none
+        if self.shared != none: self.poll()
+
+    pub func output_running() -> bool:
+        return self.output != none
+
+    ## Frames per buffer of the running device, else 0.
+    pub func buffer_frames() -> i64:
+        if let made = self.output: return (i64)made.buffer_frames
+        return 0
+
+    ## What it takes a note to reach the speaker: the buffer and the
+    ## device's own latency, in milliseconds.
+    pub func output_latency() -> f64:
+        if let made = self.output:
+            return f64(made.buffer_frames + made.output_latency) / made.sample_rate * 1000.0
+        return 0.0
+
+    # ------------------------------------------------ offline
+
+    ## Render `frames` samples without a device (tests, bouncing); read
+    ## them with `sample` and `level`.
+    pub func render(frames: i64) -> !:
+        if self.output != none:
+            error(result.invalid, "the engine renders offline only while no device plays")
+        if frames < 0:
+            error(result.invalid, "a render has a length")
+        if self.left.length > 0: free(self.left) in memory.heap
+        if self.right.length > 0: free(self.right) in memory.heap
+        self.left = self.left[0..<0]
+        self.right = self.right[0..<0]
+        self.left = try new f32[(usize)frames] in memory.heap
+        self.right = try new f32[(usize)frames] in memory.heap
+        let shared = self.link()
+        if let old = shared.retired.swap(none, .acq_rel): program.destroy(old)
+        process(shared, self.left, self.right, (usize)frames)
+        # Offline, the live MIDI ring has no listener: empty it.
+        if let ring = shared.midi.load(.acquire):
+            var event: MidiEvent
+            while ring.next(&event): _ = 0
+        if let old = shared.retired.swap(none, .acq_rel): program.destroy(old)
+        self.rendered = (usize)frames
+
+    ## Write the last render to `path` as a 24-bit stereo WAV.
+    pub func export_wav(path: str) -> !:
+        try save_wav(&self, path)
+
+    ## Sample `index` of channel `channel` (0 left, 1 right) of the last render.
+    pub func sample(channel: i64, index: i64) -> f64:
+        if index < 0 or (usize)index >= self.rendered: return 0.0
+        return (f64)(self.left[(usize)index] if channel == 0 else self.right[(usize)index])
+
+    ## The RMS level of channel `channel` of the last render, from sample
+    ## `start` to `end` (-1: its end).
+    pub func level(channel: i64, start: i64 = 0, end: i64 = -1) -> f64:
+        let samples = self.left if channel == 0 else self.right
+        var sum: f64 = 0.0
+        var count: usize = 0
+        var i = (usize)(start if start > 0 else 0)
+        let stop = self.rendered if end < 0 or (usize)end > self.rendered else (usize)end
+        while i < stop:
+            sum += (f64)samples[i] * (f64)samples[i]
+            count += 1
+            i += 1
+        if count == 0: return 0.0
+        return f64_sqrt(sum / (f64)count)
+
+## Write the last render to `path` as a 24-bit stereo WAV.
+pub func save_wav(engine: const Engine*, path: str) -> !:
+    let frames = engine.rendered
+    let rate = (u32)engine.link().rate
+    let size = 44 + frames * 6
+    var bytes = try new u8[size] --- in memory.heap
+    defer free(bytes) in memory.heap
+    put(bytes, 0, b"RIFF")
+    put32(bytes, 4, (u32)(size - 8))
+    put(bytes, 8, b"WAVEfmt ")
+    put32(bytes, 16, 16)
+    put16(bytes, 20, 1)
+    put16(bytes, 22, 2)
+    put32(bytes, 24, rate)
+    put32(bytes, 28, rate * 6)
+    put16(bytes, 32, 6)
+    put16(bytes, 34, 24)
+    put(bytes, 36, b"data")
+    put32(bytes, 40, (u32)(frames * 6))
+    for i in 0..<frames:
+        put24(bytes, 44 + i * 6, engine.left[i])
+        put24(bytes, 47 + i * 6, engine.right[i])
+    let name = try strings.copy(path)
+    defer strings.release(name)
+    try files.write((c.str)name, bytes)
+
+func put(bytes: u8[], at: usize, text: const u8[]):
+    for i in 0..<text.length: bytes[at + i] = text[i]
+
+func put16(bytes: u8[], at: usize, value: u16):
+    bytes[at] = (u8)value
+    bytes[at + 1] = (u8)(value >> 8)
+
+func put32(bytes: u8[], at: usize, value: u32):
+    bytes[at] = (u8)value
+    bytes[at + 1] = (u8)(value >> 8)
+    bytes[at + 2] = (u8)(value >> 16)
+    bytes[at + 3] = (u8)(value >> 24)
+
+func put24(bytes: u8[], at: usize, sample: f32):
+    let clipped = dsp.clampf(sample, -1.0, 1.0)
+    let value = (u32)(i32)(clipped * 8388607.0)
+    bytes[at] = (u8)value
+    bytes[at + 1] = (u8)(value >> 8)
+    bytes[at + 2] = (u8)(value >> 16)
+
+extern func sqrt(x: f64) -> f64
+func f64_sqrt(x: f64) -> f64:
+    return sqrt(x)
+
+pub let engine_type: interop.Type[Engine] = interop.Type[Engine]("Engine", Engine.close, closeable = true, main_thread = true)
+
+## A stopped engine at `rate` samples a second, playing nothing.
+pub func create(rate: f64 = 48000.0) -> Engine!:
+    let shared = try new Shared in memory.heap
+    shared.rate = rate
+    shared.tempo = 120.0
+    shared.master = 1.0
+    shared.loop_end = 16.0
+    return Engine(shared = shared, output = none, rendered = 0)
+
+## An engine for Luce.
+pub func open(rate: f64 = 48000.0) -> interop.Reference[Engine]!:
+    var made = try create(rate)
+    let held = new Engine(shared = made.shared, output = none, rendered = 0) in memory.heap catch failure:
+        made.close()
+        error(failure.code, failure.message)
+    return try interop.Reference[Engine].adopt(held, engine_type, memory.heap)
+
+# ---------------------------------------------------------------- the kinds, for Luce
+
+## The scale modes `add_key` takes, as menu items: "Chromatic|Major|…".
+pub func scale_modes() -> str:
+    return scale.mode_names
+
+## The root names, "C|C♯|D|…".
+pub func scale_roots() -> str:
+    return scale.root_names
+
+## Whether MIDI note `note` is in mode `mode` on `root`.
+pub func in_scale(note: i64, root: i64, mode: i64) -> bool:
+    return scale.contains(Scale(root = (i32)root, mask = scale.mode_mask(mode)), (i32)note)
+
+## The note mode `mode` on `root` gives `note`.
+pub func quantize_note(note: i64, root: i64, mode: i64) -> i64:
+    return (i64)scale.quantize((i32)note, Scale(root = (i32)root, mask = scale.mode_mask(mode)))
+
+pub func kind_count() -> i64:
+    return (i64)kinds.count
+
+func kind_spec(kind: i64) -> kinds.KindSpec:
+    return kinds.kinds[(usize)kind if kind >= 0 and kind < (i64)kinds.count else 0]
+
+pub func kind_name(kind: i64) -> str:
+    return kind_spec(kind).name
+
+pub func kind_category(kind: i64) -> str:
+    return kind_spec(kind).category
+
+pub func kind_doc(kind: i64) -> str:
+    return kind_spec(kind).doc
+
+## A kind's input (or output) ports, comma-separated.
+pub func kind_inputs(kind: i64) -> str:
+    return kind_spec(kind).inputs
+
+pub func kind_outputs(kind: i64) -> str:
+    return kind_spec(kind).outputs
+
+pub func param_count(kind: i64) -> i64:
+    return (i64)kind_spec(kind).count
+
+func param_spec(kind: i64, index: i64) -> kinds.ParamSpec:
+    let spec = kind_spec(kind)
+    let at = (usize)index if index >= 0 and index < (i64)spec.count else 0
+    return kinds.params[(usize)spec.first + at]
+
+pub func param_name(kind: i64, index: i64) -> str:
+    return param_spec(kind, index).name
+
+pub func param_minimum(kind: i64, index: i64) -> f64:
+    return param_spec(kind, index).minimum
+
+pub func param_maximum(kind: i64, index: i64) -> f64:
+    return param_spec(kind, index).maximum
+
+pub func param_default(kind: i64, index: i64) -> f64:
+    return param_spec(kind, index).initial
+
+pub func param_units(kind: i64, index: i64) -> str:
+    return param_spec(kind, index).units
+
+pub func param_items(kind: i64, index: i64) -> str:
+    return param_spec(kind, index).items
+
+pub func param_logarithmic(kind: i64, index: i64) -> bool:
+    return param_spec(kind, index).logarithmic
+
+# ---------------------------------------------------------------- tests
+
+## A track playing a four-voice synth: Note In → Oscillator (sine) →
+## Multiply by an Envelope → Output. Answers (track, synth, lane, envelope).
+func synth(engine: Engine*) -> (i64, i64, i64, i64)!:
+    let track = try engine.add_track(1, 2, 1.0, 0.0, false, false)
+    let voice = try engine.add_unit(track, 10, 4, true)
+    let note = try engine.add_node(voice, 100, (i64)kinds.note_in)
+    let tone = try engine.add_node(voice, 101, (i64)kinds.oscillator)
+    let shape = try engine.add_node(voice, 102, (i64)kinds.envelope)
+    let amp = try engine.add_node(voice, 103, (i64)kinds.multiply)
+    let out = try engine.add_node(voice, 104, (i64)kinds.output)
+    engine.node_param(tone, 0, 0.0)
+    engine.node_param(tone, 4, 0.5)
+    engine.node_param(shape, 3, 0.05)
+    try engine.wire(note, 0, tone, 0)
+    try engine.wire(tone, 0, amp, 0)
+    try engine.wire(shape, 0, amp, 1)
+    try engine.wire(amp, 0, out, 0)
+    let lane = try engine.add_lane(track, 20, false)
+    try engine.play_notes(lane, voice)
+    return (track, voice, lane, shape)
+
+func crossings(engine: const Engine*, start: usize, end: usize) -> i64:
+    var count: i64 = 0
+    for i in start + 1..<end:
+        if (engine.left[i - 1] < 0.0) != (engine.left[i] < 0.0): count += 1
+    return count
+
+test "a note sounds at its pitch and falls silent after its release":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let (track, voice, lane, shape) = try synth(&engine)
+    # A4 for one beat: half a second at 120 bpm.
+    try engine.add_note(lane, 0.0, 1.0, 69, 1.0, 0.0)
+    try engine.commit()
+    engine.play()
+    try engine.render(48000)
+    assert(engine.level(0, 0, 19200) > 0.1)
+    # 440 Hz crosses zero 880 times a second: 352 in 0.4 s.
+    let crossed = crossings(&engine, 0, 19200)
+    assert(crossed >= 350 and crossed <= 354)
+    # Released at 0.5 s with a 50 ms release: silent by 0.7 s.
+    assert(engine.level(0, 33600, 48000) < 0.0005)
+    assert(engine.position() > 1.99 and engine.position() < 2.01)
+
+test "a note starts on its sample":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let (track, voice, lane, shape) = try synth(&engine)
+    # Beat 0.5 is 0.25 s: sample 12000.
+    try engine.add_note(lane, 0.5, 0.5, 60, 1.0, 0.0)
+    try engine.commit()
+    engine.play()
+    try engine.render(13000)
+    var before: f64 = 0.0
+    for i in 0..<12000: before += dsp_abs(engine.sample(0, (i64)i))
+    var after: f64 = 0.0
+    for i in 12000..<12100: after += dsp_abs(engine.sample(0, (i64)i))
+    assert(before == 0.0 and after > 0.0)
+
+test "notes take the song's key where they start, and a track playing as written keeps them":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let (track, voice, lane, shape) = try synth(&engine)
+    # A minor, then B♭ major from beat 2 (120 bpm: a beat is 24000 samples).
+    try engine.add_key(-1, 0.0, 9, 2)
+    try engine.add_key(-1, 2.0, 10, 1)
+    # B♭4 twice: A minor has no B♭, so the first is A4 (440 Hz); the second is B♭ (466 Hz).
+    try engine.add_note(lane, 0.0, 1.0, 70, 1.0, 0.0)
+    try engine.add_note(lane, 2.0, 1.0, 70, 1.0, 0.0)
+    try engine.commit()
+    engine.play()
+    try engine.render(72000)
+    let first = crossings(&engine, 0, 19200)
+    let second = crossings(&engine, 48000, 67200)
+    assert(first >= 350 and first <= 354, "A minor moves B♭ to A")
+    assert(second >= 371 and second <= 375, "B♭ major keeps B♭")
+    # As written: the first note stays B♭.
+    engine.begin()
+    let plain = try engine.add_track(1, 2, 1.0, 0.0, false, false, keyed = 0)
+    try engine.add_key(-1, 0.0, 9, 2)
+    let player = try engine.add_unit(plain, 10, 4, true)
+    let note = try engine.add_node(player, 100, (i64)kinds.note_in)
+    let tone = try engine.add_node(player, 101, (i64)kinds.oscillator)
+    let out = try engine.add_node(player, 104, (i64)kinds.output)
+    engine.node_param(tone, 0, 0.0)
+    engine.node_param(tone, 4, 0.5)
+    try engine.wire(note, 0, tone, 0)
+    try engine.wire(tone, 0, out, 0)
+    let written = try engine.add_lane(plain, 20, false)
+    try engine.play_notes(written, player)
+    try engine.add_note(written, 0.0, 1.0, 70, 1.0, 0.0)
+    try engine.commit()
+    engine.stop()
+    engine.seek(0.0)
+    engine.play()
+    try engine.render(24000)
+    let kept = crossings(&engine, 0, 19200)
+    assert(kept >= 371 and kept <= 375, "a track as written ignores the key")
+
+test "a held key's release finds the voice its scale moved":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let (track, voice, lane, shape) = try synth(&engine)
+    try engine.add_key(-1, 0.0, 0, 1)
+    try engine.commit()
+    # C♯ in C major sounds C; releasing C♯ must end it.
+    engine.note_on(10, 61, 1.0)
+    try engine.render(4800)
+    assert(engine.level(0, 0, 4800) > 0.1)
+    engine.note_off(10, 61)
+    try engine.render(48000)
+    assert(engine.level(0, 24000, 48000) < 0.0005)
+
+test "MIDI plays the tracks listening for its source and channel, through their scale":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let keys = try engine.add_track(1, 2, 1.0, 0.0, false, false, midi_in = 0, channel = 2)
+    let player = try engine.add_unit(keys, 10, 4, true)
+    let note = try engine.add_node(player, 100, (i64)kinds.note_in)
+    let tone = try engine.add_node(player, 101, (i64)kinds.oscillator)
+    let out = try engine.add_node(player, 104, (i64)kinds.output)
+    engine.node_param(tone, 0, 0.0)
+    engine.node_param(tone, 4, 0.5)
+    try engine.wire(note, 0, tone, 0)
+    try engine.wire(tone, 0, out, 0)
+    try engine.listen(keys, player)
+    try engine.add_key(-1, 0.0, 9, 2)
+    try engine.commit()
+    let shared = engine.link()
+    let running = shared.current else trap("no program")
+    # Channel 1 is not this track's.
+    route_midi(shared, running, MidiEvent(source = 5, status = 0x90, data1 = 70, data2 = 100, nanos = 0))
+    try engine.render(4800)
+    assert(engine.level(0, 0, 4800) == 0.0)
+    # Channel 2: B♭4 in A minor sounds A4.
+    route_midi(shared, running, MidiEvent(source = 5, status = 0x91, data1 = 70, data2 = 100, nanos = 0))
+    try engine.render(19200)
+    let crossed = crossings(&engine, 0, 19200)
+    assert(crossed >= 350 and crossed <= 354)
+    # Its note-off (a note-on at velocity 0) names the key pressed, B♭.
+    route_midi(shared, running, MidiEvent(source = 5, status = 0x91, data1 = 70, data2 = 0, nanos = 0))
+    try engine.render(48000)
+    assert(engine.level(0, 24000, 48000) < 0.0005)
+
+test "the metronome clicks on the beat, higher on the bar":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let track = try engine.add_track(1, 2, 1.0, 0.0, false, false)
+    try engine.commit()
+    engine.set_metronome(true, 4)
+    engine.play()
+    # 120 bpm: beats at 0, 24000, 48000 samples.
+    try engine.render(50000)
+    assert(engine.level(0, 0, 1200) > 0.05 and engine.level(0, 2000, 23900) == 0.0)
+    assert(engine.level(0, 24000, 25200) > 0.05)
+    let bar = crossings(&engine, 0, 1200)
+    let beat = crossings(&engine, 24000, 25200)
+    assert(bar > beat)
+
+func dsp_abs(x: f64) -> f64:
+    return -x if x < 0.0 else x
+
+test "an edit while a note sounds keeps the note going":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    var parts = try synth(&engine)
+    try engine.add_note(parts.2, 0.0, 4.0, 60, 1.0, 0.0)
+    try engine.commit()
+    engine.play()
+    try engine.render(4800)
+    let first = engine.level(0, 2400, 4800)
+    # The same song again, the oscillator a square now: the voice carries over.
+    engine.begin()
+    parts = try synth(&engine)
+    engine.node_param(1, 0, 3.0)
+    try engine.add_note(parts.2, 0.0, 4.0, 60, 1.0, 0.0)
+    try engine.commit()
+    try engine.render(4800)
+    # No restart: the attack would begin from silence.
+    assert(engine.level(0, 0, 240) > first * 0.5)
+    assert(engine.sounding_voices() == 1)
+
+test "a curve lane drives a control input across the beats":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let track = try engine.add_track(1, 2, 1.0, 0.0, false, false)
+    let level = try engine.add_unit(track, 30, 1, true)
+    let control = try engine.add_node(level, 300, (i64)kinds.control_in)
+    let out = try engine.add_node(level, 301, (i64)kinds.output)
+    try engine.wire(control, 0, out, 0)
+    let lane = try engine.add_lane(track, 40, true)
+    engine.drive(lane, level, 0)
+    try engine.add_point(lane, 0.0, 0.0, 0)
+    try engine.add_point(lane, 4.0, 1.0, 0)
+    try engine.commit()
+    engine.play()
+    # Two beats at 120 bpm: one second, halfway up the ramp.
+    try engine.render(48000)
+    let last = engine.sample(0, 47999)
+    assert(last > 0.49 and last < 0.51)
+
+test "an effect hears the instrument it is fed and a muted track is silent":
+    var engine = try create(48000.0)
+    defer engine.close()
+    engine.begin()
+    let track = try engine.add_track(1, 2, 1.0, 0.0, false, false)
+    let voice = try engine.add_unit(track, 10, 1, false)
+    let note = try engine.add_node(voice, 100, (i64)kinds.note_in)
+    let tone = try engine.add_node(voice, 101, (i64)kinds.oscillator)
+    let out = try engine.add_node(voice, 102, (i64)kinds.output)
+    try engine.wire(note, 0, tone, 0)
+    try engine.wire(tone, 0, out, 0)
+    let effect = try engine.add_unit(track, 11, 1, true)
+    let input = try engine.add_node(effect, 110, (i64)kinds.audio_in)
+    let louder = try engine.add_node(effect, 111, (i64)kinds.gain)
+    let after = try engine.add_node(effect, 112, (i64)kinds.output)
+    engine.node_param(louder, 0, -6.0206)
+    try engine.wire(input, 0, louder, 0)
+    try engine.wire(louder, 0, after, 0)
+    try engine.feed(effect, voice)
+    let lane = try engine.add_lane(track, 20, false)
+    try engine.play_notes(lane, voice)
+    try engine.add_note(lane, 0.0, 8.0, 60, 1.0, 0.0)
+    try engine.commit()
+    engine.play()
+    try engine.render(9600)
+    # A saw at level 0.5 halved: RMS 0.25 / sqrt(3).
+    let heard = engine.level(0, 2400, 9600)
+    assert(heard > 0.13 and heard < 0.16)
+    engine.set_track(1, 1.0, 0.0, true, false)
+    try engine.render(4800)
+    assert(engine.level(0) == 0.0)
+
+test "the master track's chain hears the whole mix, and solo leaves it on":
+    for chained in [false, true]:
+        var engine = try create(48000.0)
+        defer engine.close()
+        engine.begin()
+        let track = try engine.add_track(1, 2, 1.0, 0.0, false, false)
+        let voice = try engine.add_unit(track, 10, 1, true)
+        let note = try engine.add_node(voice, 100, (i64)kinds.note_in)
+        let tone = try engine.add_node(voice, 101, (i64)kinds.oscillator)
+        let out = try engine.add_node(voice, 102, (i64)kinds.output)
+        try engine.wire(note, 0, tone, 0)
+        try engine.wire(tone, 0, out, 0)
+        let master = try engine.add_track(2, 2, 1.0, 0.0, false, false, true)
+        if chained:
+            let effect = try engine.add_unit(master, 20, 1, true)
+            let input = try engine.add_node(effect, 200, (i64)kinds.audio_in)
+            let quieter = try engine.add_node(effect, 201, (i64)kinds.gain)
+            let after = try engine.add_node(effect, 202, (i64)kinds.output)
+            engine.node_param(quieter, 0, -6.0206)
+            try engine.wire(input, 0, quieter, 0)
+            try engine.wire(input, 1, quieter, 0)
+            try engine.wire(quieter, 0, after, 0)
+        let lane = try engine.add_lane(track, 30, false)
+        try engine.play_notes(lane, voice)
+        try engine.add_note(lane, 0.0, 8.0, 60, 1.0, 0.0)
+        try engine.commit()
+        engine.play()
+        try engine.render(9600)
+        let heard = engine.level(0, 2400, 9600)
+        # The saw at 0.5: RMS 0.289, halved by the master's chain.
+        if chained:
+            assert(heard > 0.13 and heard < 0.16, "the master's gain")
+        else:
+            assert(heard > 0.27 and heard < 0.31, "an empty master passes the mix")
+        engine.set_track(1, 1.0, 0.0, false, true)
+        try engine.render(4800)
+        assert(engine.level(0) > 0.1, "a solo does not silence the master")
+
+test "every kind, fed a loud saw on every input, stays finite and bounded":
+    for kind in 0..<(i64)kinds.count:
+        var engine = try create(48000.0)
+        defer engine.close()
+        engine.begin()
+        let track = try engine.add_track(1, 2, 1.0, 0.0, false, false)
+        let voice = try engine.add_unit(track, 10, 2, true)
+        let note = try engine.add_node(voice, 100, (i64)kinds.note_in)
+        let saw = try engine.add_node(voice, 101, (i64)kinds.oscillator)
+        let node = try engine.add_node(voice, 102, kind)
+        let out = try engine.add_node(voice, 103, (i64)kinds.output)
+        engine.node_param(saw, 4, 1.0)
+        try engine.wire(note, 0, saw, 0)
+        let inputs = kinds.input_count((u32)kind)
+        for input in 0..<inputs:
+            # The note's gate where a kind takes one, the saw elsewhere.
+            if kinds.name_at(kinds.kinds[(usize)kind].inputs, input) == "gate":
+                try engine.wire(note, 1, node, (i64)input)
+            else:
+                try engine.wire(saw, 0, node, (i64)input)
+        if kinds.output_count((u32)kind) > 0:
+            try engine.wire(node, 0, out, 0)
+        let lane = try engine.add_lane(track, 20, false)
+        try engine.play_notes(lane, voice)
+        try engine.add_note(lane, 0.0, 1.0, 48, 1.0, 0.0)
+        try engine.add_note(lane, 0.5, 1.0, 84, 1.0, 0.0)
+        try engine.commit()
+        engine.play()
+        try engine.render(48000)
+        for i in 0..<48000:
+            let v = engine.sample(0, (i64)i)
+            assert(v == v and v < 1.01 and v > -1.01, "a kind went non-finite or out of bounds")

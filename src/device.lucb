@@ -1,0 +1,467 @@
+## Realtime audio: the default output device (or one chosen by id) driven by
+## its own I/O thread, which calls a plain Base function once per hardware
+## buffer. Asked for inputs, the same unit also records from that device's
+## input side (duplex), and the block carries those samples for the same
+## frames. The function runs on the device's realtime thread: it must not
+## allocate, lock, fail or call into full Luce. macOS drives it through a HAL
+## output unit; other hosts answer `unsupported`.
+import memory
+import platform
+import strings
+import result
+import coreaudio
+from coreaudio import Buffer, BufferList, InputList, TimeStamp, PropertyAddress, StreamDescription, ComponentDescription, RenderCallback, ValueRange
+
+pub let most_channels: usize = 8
+## The largest slice the unit is allowed to ask for; input buffers hold this many frames.
+pub let most_frames: u32 = 4096
+
+## One hardware buffer to fill: `frames` samples in each of `channels`
+## non-interleaved f32 outputs, all of which start holding garbage. With
+## inputs open, `input_channels` recorded f32 channels for the same frames
+## (zeros when the device failed to deliver them, with `input_failed` set).
+pub struct Block:
+    pub var frames: usize
+    pub var channels: usize
+    pub var outputs: (f32*?)[8]
+    ## The device's running sample count at the first frame.
+    pub var sample_time: f64
+    ## When the first frame leaves the device, in host nanoseconds.
+    pub var host_nanos: u64
+    ## How many of `inputs` hold recorded samples; 0 when no input is open.
+    pub var input_channels: usize = 0
+    ## The recorded channels, in the order asked for: inputs[0] is the
+    ## device's input `first_input`.
+    pub var inputs: (f32*?)[8]
+    ## The device did not deliver this block's input: `inputs` are zeros.
+    pub var input_failed: bool = false
+
+    ## Channel `channel`'s samples.
+    pub func output(channel: usize) -> f32[]:
+        var empty: f32[]
+        if channel >= self.channels:
+            return empty
+        let data = self.outputs[channel] else return empty
+        return f32[](data, self.frames)
+
+    ## Recorded channel `channel`'s samples; empty when there is no such input.
+    pub func input(channel: usize) -> f32[]:
+        var empty: f32[]
+        if channel >= self.input_channels:
+            return empty
+        let data = self.inputs[channel] else return empty
+        return f32[](data, self.frames)
+
+pub type Render = func(void*?, Block*) -> unit
+
+## What the I/O thread reaches through its context: kept on the heap so the
+## Device value may move.
+struct Link:
+    var render: Render
+    var context: void*?
+    ## The unit, to pull input from; none without inputs.
+    var unit: void*?
+    var input_channels: u32
+    ## `input_channels` runs of `most_frames` samples.
+    var input_memory: f32[]
+    var list: InputList
+    var callbacks: @u64
+    var input_failures: @u64
+
+pub struct Device:
+    var unit: void*?
+    var link: Link*?
+    var running: bool
+    pub var device_id: u32
+    pub var sample_rate: f64
+    ## Frames per hardware buffer, as the device took it.
+    pub var buffer_frames: u32
+    pub var channels: u32
+    ## The device's own latency and safety offset, in frames.
+    pub var output_latency: u32
+    ## Recorded channels delivered in each block, 0 without input.
+    pub var input_channels: u32 = 0
+    ## The device input the first recorded channel comes from, from 0.
+    pub var first_input: u32 = 0
+    ## All the input channels the device has (0 when input was not asked for).
+    pub var device_inputs: u32 = 0
+    ## From the moment sound reaches the device's input to the block that
+    ## carries it, in frames: the device's input latency, its input safety
+    ## offset and one buffer. A recording lines up with what was heard when
+    ## shifted earlier by input_latency + output_latency + buffer_frames.
+    pub var input_latency: u32 = 0
+
+    ## Open the default output device (or `device_id`, when not 0) with
+    ## `channels` outputs and ask for `frames` per buffer (the device may
+    ## round it into its range). With `inputs` above 0, also record that many
+    ## channels (up to 8) from the same device's input side, starting at its
+    ## input `first_input` (from 0: the Volt's inputs 3-4 are first_input = 2,
+    ## inputs = 2). Nothing plays until `start`.
+    pub static func open(render: Render, context: void*?, frames: u32 = 64, channels: u32 = 2, inputs: u32 = 0, first_input: u32 = 0, device_id: u32 = 0) -> Device!:
+        if not platform.macos:
+            error(result.unsupported, "realtime output is implemented on macOS only")
+        if channels < 1 or (usize)channels > most_channels:
+            error(result.invalid, "an output device has 1 to 8 channels")
+        var device = Device(unit = none, link = none, running = false, device_id = 0, sample_rate = 0.0, buffer_frames = 0, channels = channels, output_latency = 0)
+        errdefer device.close()
+        device.device_id = device_id
+        if device_id == 0:
+            device.device_id = try default_output()
+        if inputs > 0:
+            device.device_inputs = channel_count(device.device_id, true)
+            var named: u8[128]
+            try check_inputs(inputs, first_input, device.device_inputs, device_name(device.device_id, named))
+            device.input_channels = inputs
+            device.first_input = first_input
+        device.sample_rate = try nominal_rate(device.device_id)
+        device.buffer_frames = try set_buffer_frames(device.device_id, frames)
+        device.output_latency = latency_frames(device.device_id)
+        if inputs > 0:
+            device.input_latency = latency_frames(device.device_id, true) + device.buffer_frames
+        let description = ComponentDescription(kind = coreaudio.type_output, sub_kind = coreaudio.sub_hal_output, manufacturer = coreaudio.manufacturer_apple, flags = 0, flags_mask = 0)
+        let component = coreaudio.AudioComponentFindNext(none, &description) else error(result.failed, "no HAL output unit")
+        let (status, made) = coreaudio.AudioComponentInstanceNew(component)
+        try check(status, "AudioComponentInstanceNew")
+        let au = made else error(result.failed, "AudioComponentInstanceNew made nothing")
+        device.unit = au
+        if inputs > 0:
+            # Input must be enabled before the device is set.
+            let on: u32 = 1
+            try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_enable_io, coreaudio.scope_input, 1, &on, 4), "enable input")
+        let id = device.device_id
+        try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_current_device, coreaudio.scope_global, 0, &id, 4), "set the device")
+        let format = float_format(device.sample_rate, channels)
+        try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_stream_format, coreaudio.scope_input, 0, &format, (u32)memory.size_of(StreamDescription)), "set the stream format")
+        if inputs > 0:
+            let recorded = float_format(device.sample_rate, inputs)
+            try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_stream_format, coreaudio.scope_output, 1, &recorded, (u32)memory.size_of(StreamDescription)), "set the input format")
+            var map: i32[8] = [0, 0, 0, 0, 0, 0, 0, 0]
+            for slot in 0..<(usize)inputs:
+                map[slot] = (i32)(first_input + (u32)slot)
+            try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_channel_map, coreaudio.scope_output, 1, &map, inputs * 4), "set the input channel map")
+        let most: u32 = most_frames
+        try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_maximum_frames, coreaudio.scope_global, 0, &most, 4), "set the largest slice")
+        let link = try new Link(render = render, context = context) in memory.heap
+        device.link = link
+        if inputs > 0:
+            link.input_memory = try new f32[(usize)inputs * (usize)most_frames] in memory.heap
+            link.input_channels = inputs
+            link.unit = au
+        let callback = RenderCallback(proc = io_proc, context = (void*)link)
+        try check(coreaudio.AudioUnitSetProperty(au, coreaudio.property_render_callback, coreaudio.scope_input, 0, &callback, (u32)memory.size_of(RenderCallback)), "set the render callback")
+        try check(coreaudio.AudioUnitInitialize(au), "AudioUnitInitialize")
+        return device
+
+    ## Start calling the render function.
+    pub func start() -> !:
+        let au = self.unit else error(result.invalid, "the device is closed")
+        if self.running:
+            return
+        try check(coreaudio.AudioOutputUnitStart(au), "AudioOutputUnitStart")
+        self.running = true
+
+    ## Stop calling it; when this returns, no call is in progress.
+    pub func stop():
+        if let au = self.unit:
+            if self.running:
+                _ = coreaudio.AudioOutputUnitStop(au)
+        self.running = false
+
+    pub func close():
+        self.stop()
+        if let au = self.unit:
+            _ = coreaudio.AudioUnitUninitialize(au)
+            _ = coreaudio.AudioComponentInstanceDispose(au)
+        self.unit = none
+        if let link = self.link:
+            if link.input_memory.length > 0:
+                free(link.input_memory) in memory.heap
+            free(link) in memory.heap
+        self.link = none
+
+    ## How many times the render function has been called.
+    pub func callbacks() -> u64:
+        let link = self.link else return 0
+        return link.callbacks.load(.relaxed)
+
+    ## How many blocks' input the device failed to deliver (those blocks
+    ## carried zeros).
+    pub func input_failures() -> u64:
+        let link = self.link else return 0
+        return link.input_failures.load(.relaxed)
+
+## What the HAL unit calls on its I/O thread.
+func io_proc(context: void*?, flags: u32*, stamp: const TimeStamp*, bus: u32, frames: u32, data: BufferList*?) -> i32:
+    flush_denormals()
+    let raw = context else return 0
+    let list = data else return 0
+    let link = (Link*)raw
+    var block = Block(frames = (usize)frames, channels = 0, outputs = [none, none, none, none, none, none, none, none], sample_time = stamp.sample_time, host_nanos = coreaudio.AudioConvertHostTimeToNanos(stamp.host_time),
+        input_channels = 0, inputs = [none, none, none, none, none, none, none, none], input_failed = false)
+    var index: u32 = 0
+    while index < list.count and (usize)index < most_channels:
+        let buffer = coreaudio.buffer_at(list, index)
+        block.outputs[(usize)index] = (f32*?)buffer.data
+        index += 1
+    block.channels = (usize)index
+    if let au = link.unit:
+        pull_input(link, au, stamp, frames, &block)
+    link.callbacks.add(1, .relaxed)
+    link.render(link.context, &block)
+    return 0
+
+## Render the input bus into the link's own buffers and point the block at
+## them; on failure, zeros and a count.
+func pull_input(link: Link*, au: void*, stamp: const TimeStamp*, frames: u32, block: Block*):
+    let count = link.input_channels
+    if frames > most_frames:
+        # Never asked of a unit whose largest slice is most_frames; the
+        # buffers could not hold it, so the block carries no inputs.
+        block.input_failed = true
+        link.input_failures.add(1, .relaxed)
+        return
+    prepare_list(&link.list, link.input_memory, count, frames)
+    var action: u32 = 0
+    let status = coreaudio.AudioUnitRender(au, &action, stamp, 1, frames, (BufferList*)&link.list)
+    let span = (usize)frames
+    for channel in 0..<(usize)count:
+        let start = channel * (usize)most_frames
+        let samples = link.input_memory[start..<start + span]
+        if status != 0:
+            for i in 0..<span: samples[i] = 0.0
+        block.inputs[channel] = samples.data
+    block.input_channels = (usize)count
+    if status != 0:
+        block.input_failed = true
+        link.input_failures.add(1, .relaxed)
+
+## Point `list`'s first `count` buffers at consecutive `most_frames` runs of
+## `store`, each holding one channel of `frames` samples.
+func prepare_list(list: InputList*, store: f32[], count: u32, frames: u32):
+    list.count = count
+    list.pad = 0
+    let bytes = (frames if frames <= most_frames else most_frames) * 4
+    for channel in 0..<(usize)count:
+        list.buffers[channel] = Buffer(channels = 1, size = bytes, data = (void*?)store[channel * (usize)most_frames..<(channel + 1) * (usize)most_frames].data)
+
+func float_format(rate: f64, count: u32) -> StreamDescription:
+    return StreamDescription(sample_rate = rate, format = coreaudio.format_linear_pcm,
+        format_flags = coreaudio.flag_float | coreaudio.flag_packed | coreaudio.flag_non_interleaved,
+        bytes_per_packet = 4, frames_per_packet = 1, bytes_per_frame = 4, channels_per_frame = count, bits_per_channel = 32, reserved = 0)
+
+## Refuse an input request the device cannot meet, naming it.
+pub func check_inputs(inputs: u32, first_input: u32, available: u32, name: str) -> !:
+    var text: u8[256]
+    if (usize)inputs > most_channels:
+        error(result.invalid, "a device records 1 to 8 input channels at once")
+    if available == 0:
+        let message = strings.format(text, f"{name} has no inputs") catch failure:
+            recover "the device has no inputs"
+        error(result.unsupported, message)
+    if first_input >= available or inputs > available - first_input:
+        let message = strings.format(text, f"{name} has {available} inputs: it cannot record {inputs} from input {first_input + 1}") catch failure:
+            recover "the device does not have those inputs"
+        error(result.invalid, message)
+
+## Denormal floats flush to zero on this thread: a decaying filter's tail
+## would otherwise take the slow path for every sample.
+func flush_denormals():
+    asm arm64 (out("x9") _, options(nostack)):
+        mrs x9, fpcr
+        orr x9, x9, #0x1000000
+        msr fpcr, x9
+    asm x86_64 (out("rax") _):
+        sub $8, %rsp
+        stmxcsr (%rsp)
+        orl $0x8040, (%rsp)
+        ldmxcsr (%rsp)
+        add $8, %rsp
+
+func check(status: i32, what: str) -> !:
+    if status != 0:
+        var text: u8[128]
+        let message = strings.format(text, f"{what} failed (OSStatus {status})") catch failure:
+            recover what
+        error(result.failed, message)
+
+func address(selector: u32, scope: u32) -> PropertyAddress:
+    return PropertyAddress(selector = selector, scope = scope, element = 0)
+
+## The system's default output device.
+pub func default_output() -> u32!:
+    let where = address(coreaudio.default_output_device, coreaudio.object_scope_global)
+    var id: u32 = 0
+    var size: u32 = 4
+    try check(coreaudio.AudioObjectGetPropertyData(coreaudio.system_object, &where, 0, none, &size, &id), "find the default output")
+    if id == 0:
+        error(result.failed, "there is no output device")
+    return id
+
+## `device`'s sample rate.
+pub func nominal_rate(device: u32) -> f64!:
+    let where = address(coreaudio.nominal_sample_rate, coreaudio.object_scope_global)
+    var rate: f64 = 0.0
+    var size: u32 = 8
+    try check(coreaudio.AudioObjectGetPropertyData(device, &where, 0, none, &size, &rate), "read the sample rate")
+    return rate
+
+## Ask `device` for `frames` per buffer, clamped to its range; answer what it took.
+pub func set_buffer_frames(device: u32, frames: u32) -> u32!:
+    let range_at = address(coreaudio.buffer_frame_size_range, coreaudio.object_scope_global)
+    var range = ValueRange(minimum = 0.0, maximum = 0.0)
+    var range_size: u32 = (u32)memory.size_of(ValueRange)
+    var wanted = frames
+    if coreaudio.AudioObjectGetPropertyData(device, &range_at, 0, none, &range_size, &range) == 0:
+        if f64(wanted) < range.minimum: wanted = (u32)range.minimum
+        if f64(wanted) > range.maximum: wanted = (u32)range.maximum
+    let where = address(coreaudio.buffer_frame_size, coreaudio.object_scope_global)
+    _ = coreaudio.AudioObjectSetPropertyData(device, &where, 0, none, 4, &wanted)
+    var took: u32 = 0
+    var size: u32 = 4
+    try check(coreaudio.AudioObjectGetPropertyData(device, &where, 0, none, &size, &took), "read the buffer size")
+    return took
+
+## The device's output (or input) latency plus its safety offset, in frames.
+pub func latency_frames(device: u32, input: bool = false) -> u32:
+    var total: u32 = 0
+    let scope = coreaudio.object_scope_input if input else coreaudio.object_scope_output
+    for selector in [coreaudio.device_latency, coreaudio.safety_offset]:
+        let where = address(selector, scope)
+        var value: u32 = 0
+        var size: u32 = 4
+        if coreaudio.AudioObjectGetPropertyData(device, &where, 0, none, &size, &value) == 0:
+            total += value
+    return total
+
+## The system's default input device (0 when there is none). Device.open
+## records from the output device's own input side, not this one.
+pub func default_input() -> u32:
+    let where = address(coreaudio.default_input_device, coreaudio.object_scope_global)
+    var id: u32 = 0
+    var size: u32 = 4
+    if coreaudio.AudioObjectGetPropertyData(coreaudio.system_object, &where, 0, none, &size, &id) != 0:
+        return 0
+    return id
+
+## How many input (or output) channels `device` has across its streams; 0
+## when it has none or cannot say.
+pub func channel_count(device: u32, input: bool) -> u32:
+    let where = address(coreaudio.stream_configuration, coreaudio.object_scope_input if input else coreaudio.object_scope_output)
+    var size: u32 = 0
+    if coreaudio.AudioObjectGetPropertyDataSize(device, &where, 0, none, &size) != 0 or size < 8:
+        return 0
+    # Room for 127 streams; a device with more is counted up to them.
+    var words: u64[256]
+    let storage = words[0..<256]
+    if size > 2048: size = 2048
+    if coreaudio.AudioObjectGetPropertyData(device, &where, 0, none, &size, (void*)storage.data) != 0:
+        return 0
+    return stream_channels((BufferList*)storage.data, size)
+
+## The channels in a stream configuration of `size` bytes.
+pub func stream_channels(list: BufferList*, size: u32) -> u32:
+    var total: u32 = 0
+    var index: u32 = 0
+    while index < list.count and 8 + ((usize)index + 1) * 16 <= (usize)size:
+        total += coreaudio.buffer_at(list, index).channels
+        index += 1
+    return total
+
+## `device`'s name, written into `into`; empty when it cannot be read.
+pub func device_name(device: u32, into: u8[]) -> str:
+    if into.length < 2:
+        return ""
+    let where = address(coreaudio.device_name, coreaudio.object_scope_global)
+    var size = (u32)(into.length - 1)
+    for i in 0..<into.length: into[i] = 0
+    if coreaudio.AudioObjectGetPropertyData(device, &where, 0, none, &size, (void*)into.data) != 0:
+        return ""
+    var length: usize = 0
+    while length < into.length and into[length] != 0:
+        length += 1
+    return str(into[0..<length]) else ""
+
+## One audio device, for a device menu.
+pub struct DeviceInfo:
+    pub var id: u32
+    pub var inputs: u32
+    pub var outputs: u32
+    pub var name_bytes: u8[128]
+    pub var name_length: usize
+
+    pub func name() -> str:
+        return str(self.name_bytes[0..<self.name_length]) else ""
+
+## Every audio device's id, name and channel counts, as many as fit in
+## `into`; answers how many there are in all.
+pub func devices(into: DeviceInfo[]) -> usize!:
+    let where = address(coreaudio.hardware_devices, coreaudio.object_scope_global)
+    var size: u32 = 0
+    try check(coreaudio.AudioObjectGetPropertyDataSize(coreaudio.system_object, &where, 0, none, &size), "count the devices")
+    let count = (usize)size // 4
+    if count == 0:
+        return 0
+    let ids = try new u32[count] in memory.heap
+    defer free(ids) in memory.heap
+    try check(coreaudio.AudioObjectGetPropertyData(coreaudio.system_object, &where, 0, none, &size, (void*)ids.data), "list the devices")
+    let found = (usize)size // 4
+    for i in 0..<found:
+        if i >= into.length:
+            break
+        into[i] = describe(ids[i])
+    return found
+
+## One device's id, name and channel counts.
+pub func describe(device: u32) -> DeviceInfo:
+    var info = DeviceInfo(id = device, inputs = channel_count(device, true), outputs = channel_count(device, false), name_length = 0)
+    let text = device_name(device, info.name_bytes)
+    info.name_length = text.length
+    return info
+
+test "an input request is checked against what the device has":
+    check_inputs(2, 0, 32, "Volt 876") catch failure:
+        assert(false, "two of 32 inputs")
+    check_inputs(2, 30, 32, "Volt 876") catch failure:
+        assert(false, "the last two of 32 inputs")
+    var refused = 0
+    check_inputs(2, 0, 0, "Speakers") catch failure:
+        assert(failure.message == "Speakers has no inputs", "names the device")
+        refused += 1
+    check_inputs(2, 31, 32, "Volt 876") catch failure:
+        refused += 1
+    check_inputs(9, 0, 32, "Volt 876") catch failure:
+        refused += 1
+    check_inputs(1, 1, 1, "Mic") catch failure:
+        refused += 1
+    assert(refused == 4, "four refusals")
+
+test "the input list points each channel at its own run and sizes it to the block":
+    var store: f32[8192]
+    var list: InputList
+    prepare_list(&list, store, 2, 64)
+    assert(list.count == 2)
+    assert(list.buffers[0].channels == 1 and list.buffers[0].size == 256)
+    let first = list.buffers[0].data else return
+    let second = list.buffers[1].data else return
+    assert((u8*)second - (u8*)first == 4096 * 4, "a channel apart")
+    assert((usize)((u8*)first - (u8*)store[0..<8192].data) == 0)
+    prepare_list(&list, store, 1, 10000)
+    assert(list.buffers[0].size == 4096 * 4, "clamped to the largest slice")
+
+test "a stream configuration's channels add up":
+    var list: InputList
+    list.count = 3
+    list.buffers[0] = Buffer(channels = 2, size = 0, data = none)
+    list.buffers[1] = Buffer(channels = 30, size = 0, data = none)
+    list.buffers[2] = Buffer(channels = 4, size = 0, data = none)
+    assert(stream_channels((BufferList*)&list, 8 + 3 * 16) == 36)
+    assert(stream_channels((BufferList*)&list, 8 + 2 * 16) == 32, "stops at the size")
+
+test "a block's inputs read back and are empty past the open channels":
+    var samples: f32[4] = [0.5, -0.5, 0.25, 0.0]
+    var block = Block(frames = 4, channels = 0, outputs = [none, none, none, none, none, none, none, none], sample_time = 0.0, host_nanos = 0)
+    assert(block.input(0).length == 0, "no inputs by default")
+    block.input_channels = 1
+    block.inputs[0] = samples[0..<4].data
+    assert(block.input(0).length == 4 and block.input(0)[1] == -0.5)
+    assert(block.input(1).length == 0)

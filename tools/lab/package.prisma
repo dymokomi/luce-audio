@@ -1,0 +1,12 @@
+#prisma 4.0
+def package "audio-lab" {
+    str owner = "dymokomi"
+    str version = "0.0.1"
+    str kind = "tool"
+    str language = "luce-base"
+    str entry = "main.lucb"
+    def dependency "luce-audio" {
+        str owner = "dymokomi"
+        str path = "../.."
+    }
+}

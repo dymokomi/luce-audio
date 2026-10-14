@@ -4,13 +4,26 @@ def package "luce-audio" {
     str version = "0.4.1"
     str kind = "package"
     str language = "luce-base"
-    str description = "Short PCM playback for Luce/Base programs. The first backend is macOS (NSSound). Windows and Linux are not implemented yet; play_pcm8 fails with unsupported there."
+    str description = "Audio for Luce/Base programs: a realtime engine (tracks, instruments and effects built from node patches, analog and FM models, mixing and mastering, scales, live MIDI) on CoreAudio with duplex input, plus short PCM playback and an OPL2/IMF renderer. macOS first; elsewhere the device answers unsupported."
     str readme = "README.md"
-    str[] public = ["audio"]
+    str[] public = ["audio", "device", "engine", "kinds", "analog", "dsp", "scale"]
 
     def native "inputs" {
-        str[] sources = ["native/fmopl.c", "native/imf.c"]
         str[] frameworks = ["AppKit", "Foundation"]
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str path = "../luce-std"
+    }
+
+    def dependency "luce-midi" {
+        str owner = "dymokomi"
+        str path = "../luce-midi"
+    }
+
+    def native "macos" {
+        str[] frameworks = ["AudioToolbox", "CoreAudio"]
     }
 
 }

@@ -1,16 +1,13 @@
 ## Short PCM playback. macOS plays 8-bit mono through NSSound; other hosts fail.
-import c
 import memory
 import platform
 import macos
 import result
+import opl
 
 pub let unsupported: ErrorCode = result.unsupported
 pub let invalid: ErrorCode = result.invalid
 pub let failed: ErrorCode = result.failed
-
-extern func luce_imf_pcm_bytes(imf: const u8*, imf_len: i32, rate: i32) -> i32
-extern func luce_imf_render(imf: const u8*, imf_len: i32, rate: i32, dest: const u8*, dest_len: i32) -> i32
 
 ## A process-side mixer that can overlap a few one-shot clips plus one looping song.
 pub struct Player:
@@ -46,20 +43,70 @@ pub struct Player:
     pub func stop_loop():
         macos.stop_loop(&self.host)
 
-## Render one loop of Wolf3D IMF (AdLib) to signed 16-bit mono PCM.
+## IMF songs tick at 700 Hz (Wolf3D's SDL_IMFMusicPlayer).
+let imf_ticks: i64 = 700
+
+inline func u16le(bytes: const u8[], at: usize) -> i64:
+    return (i64)bytes[at] | ((i64)bytes[at + 1] << 8)
+
+## Where an IMF song's commands start and how many bytes of them there are:
+## a type-1 song leads with its length, a type-0 song is all commands.
+func imf_commands(imf: const u8[]) -> (usize, i64):
+    if u16le(imf, 0) != 0:
+        return (2, u16le(imf, 0))
+    return (0, (i64)imf.length)
+
+## The samples one loop of `imf` lasts at `rate`: its ticks at 700 Hz, a
+## tenth of a second when it has none, three minutes at most.
+func imf_samples(imf: const u8[], rate: i64) -> i64:
+    var (pos, remaining) = imf_commands(imf)
+    var ticks: i64 = 0
+    while remaining >= 4 and pos + 4 <= imf.length:
+        ticks += u16le(imf, pos + 2)
+        pos += 4
+        remaining -= 4
+    var samples = ticks * rate // imf_ticks
+    if samples < 1:
+        samples = rate // 10
+    if samples > rate * 180:
+        samples = rate * 180
+    return samples
+
+## Render one loop of Wolf3D IMF (AdLib) to signed 16-bit mono PCM, as
+## Wolf4SDL's SD_StartMusic and its 700 Hz IMF player play it on an OPL2.
 pub func render_imf(imf: const u8[], rate: i64) -> u8[]!:
     if imf.length < 4 or rate < 1000 or rate > 48000:
         error(invalid, "IMF is truncated or the rate is out of range")
-    let bytes = (i64)luce_imf_pcm_bytes(imf.data, (i32)imf.length, (i32)rate)
-    if bytes < 2:
-        error(failed, "IMF produced no PCM")
+    let bytes = imf_samples(imf, rate) * 2
     var pcm = try new u8[(usize)bytes] --- in memory.heap
     errdefer free(pcm) in memory.heap
-    let wrote = luce_imf_render(imf.data, (i32)imf.length, (i32)rate, pcm.data, (i32)bytes)
-    if wrote < 2:
+    let chip = try new opl.Opl in memory.heap
+    defer free(chip) in memory.heap
+    chip.start(opl.adlib_clock, (i32)rate)
+    for reg: i32 in 1..<0xf6:
+        chip.write(reg, 0)
+    chip.write(1, 0x20)
+
+    var (pos, remaining) = imf_commands(imf)
+    let most = bytes // 2
+    var written: i64 = 0
+    var per_tick = rate // imf_ticks
+    if per_tick < 1:
+        per_tick = 1
+    while remaining >= 4 and pos + 4 <= imf.length and written < most:
+        chip.write((i32)imf[pos], (i32)imf[pos + 1])
+        var n = u16le(imf, pos + 2) * per_tick
+        if n > most - written:
+            n = most - written
+        if n > 0:
+            chip.render(pcm[(usize)(written * 2)..<(usize)((written + n) * 2)])
+            written += n
+        pos += 4
+        remaining -= 4
+    if written < 1:
         error(failed, "IMF render failed")
-    if wrote < bytes:
-        return pcm[0..<(usize)wrote]
+    if written < most:
+        return pcm[0..<(usize)(written * 2)]
     return pcm
 
 test "an IMF song renders to one loop of 16-bit PCM":
@@ -69,6 +116,45 @@ test "an IMF song renders to one loop of 16-bit PCM":
     defer free(pcm) in memory.heap
     # whole samples per tick: 31 at 22050 Hz, so 700 ticks are 21700 samples
     assert(pcm.length == 43400)
+
+## FNV-1a over bytes.
+func bytes_hash(bytes: const u8[]) -> u32:
+    var h: u32 = 0x811c9dc5
+    for byte in bytes:
+        h = (h ^ (u32)byte) *% 0x01000193
+    return h
+
+inline func sample_at(pcm: const u8[], index: usize) -> i16:
+    return (i16)((u16)pcm[index * 2] | ((u16)pcm[index * 2 + 1] << 8))
+
+test "the OPL2 renders an IMF song bit for bit as the C core did":
+    # Two voices (feedback, the 0x01 waveform enable, waveforms 1-3, KSL, AM
+    # and vibrato), then rhythm mode with every drum, both LFO depths, then the shallow tremolo.
+    let song: u8[242] = [
+        0xf0, 0x00, 0x01, 0x20, 0x00, 0x00, 0x20, 0xe1, 0x00, 0x00, 0x23, 0x61, 0x00, 0x00, 0x40, 0x8f,
+        0x00, 0x00, 0x43, 0x00, 0x00, 0x00, 0x60, 0xf2, 0x00, 0x00, 0x63, 0xf4, 0x00, 0x00, 0x80, 0x54,
+        0x00, 0x00, 0x83, 0x26, 0x00, 0x00, 0xe0, 0x01, 0x00, 0x00, 0xe3, 0x02, 0x00, 0x00, 0xc0, 0x0e,
+        0x00, 0x00, 0xa0, 0x98, 0x00, 0x00, 0xb0, 0x31, 0x14, 0x00, 0x21, 0x02, 0x00, 0x00, 0x24, 0x01,
+        0x00, 0x00, 0x41, 0x50, 0x00, 0x00, 0x44, 0xc5, 0x00, 0x00, 0x61, 0xa4, 0x00, 0x00, 0x64, 0xc3,
+        0x00, 0x00, 0x81, 0x33, 0x00, 0x00, 0x84, 0x45, 0x00, 0x00, 0xe1, 0x03, 0x00, 0x00, 0xe4, 0x01,
+        0x00, 0x00, 0xc1, 0x07, 0x00, 0x00, 0xa1, 0x41, 0x00, 0x00, 0xb1, 0x2e, 0x14, 0x00, 0x30, 0x01,
+        0x00, 0x00, 0x33, 0x01, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x53, 0x00, 0x00, 0x00, 0x70, 0xf8,
+        0x00, 0x00, 0x73, 0xf6, 0x00, 0x00, 0x90, 0x77, 0x00, 0x00, 0x93, 0x77, 0x00, 0x00, 0x31, 0x01,
+        0x00, 0x00, 0x34, 0x01, 0x00, 0x00, 0x32, 0x01, 0x00, 0x00, 0x35, 0x01, 0x00, 0x00, 0x51, 0x00,
+        0x00, 0x00, 0x54, 0x00, 0x00, 0x00, 0x52, 0x00, 0x00, 0x00, 0x55, 0x00, 0x00, 0x00, 0x71, 0xf7,
+        0x00, 0x00, 0x74, 0xf7, 0x00, 0x00, 0x72, 0xf7, 0x00, 0x00, 0x75, 0xf7, 0x00, 0x00, 0x91, 0x77,
+        0x00, 0x00, 0x94, 0x77, 0x00, 0x00, 0x92, 0x77, 0x00, 0x00, 0x95, 0x77, 0x00, 0x00, 0xa6, 0x57,
+        0x00, 0x00, 0xb6, 0x09, 0x00, 0x00, 0xa7, 0x58, 0x00, 0x00, 0xb7, 0x0a, 0x00, 0x00, 0xa8, 0x42,
+        0x00, 0x00, 0xb8, 0x05, 0x00, 0x00, 0xbd, 0xff, 0x1e, 0x00, 0xbd, 0x60, 0x0a, 0x00, 0xb0, 0x11,
+        0x1e, 0x00
+    ]
+    let pcm = try render_imf(song, 22050)
+    defer free(pcm) in memory.heap
+    # 110 ticks of 31 samples; hash and samples from fmopl.c and imf.c
+    assert(pcm.length == 6820)
+    assert(bytes_hash(pcm) == 0x1153ff45)
+    assert(sample_at(pcm, 100) == 1748 and sample_at(pcm, 700) == 13296 and sample_at(pcm, 1300) == -32768)
+    assert(sample_at(pcm, 2000) == 14048 and sample_at(pcm, 2600) == -9620 and sample_at(pcm, 3300) == 11648)
 
 ## Whether `render_imf` refuses `imf` at `rate` as invalid.
 func refuses(imf: const u8[], rate: i64) -> bool:

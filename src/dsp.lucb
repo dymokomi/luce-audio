@@ -1,0 +1,501 @@
+## The signal kernels: single-precision math good to audio accuracy, and
+## one function a node kind, each over a block of at most `chunk` samples.
+## Nothing here allocates, locks, fails or traps: these run on the device's
+## realtime thread.
+import kinds
+
+## The most samples one kernel call processes.
+pub let chunk: usize = 64
+
+pub type Signal = const f32[]
+pub type Samples = f32[]
+
+## What one node keeps between blocks, per voice: phases, filter memories,
+## an envelope's stage, a random seed, and a delay's line.
+pub struct State:
+    pub var a: f64
+    pub var b: f64
+    pub var c: f64
+    pub var d: f64
+    pub var seed: u32
+    pub var stage: u32
+    pub var heads: u32[16]
+    pub var damp: f32[16]
+    pub var line: f32[]
+    ## This node's own analog tolerance in this voice, -1..1: fixed per node
+    ## and voice, so voices differ a little as real components do.
+    pub var variation: f32
+    ## Scratch for kinds that keep more: extra poles, envelopes, history.
+    pub var more: f64[8]
+    ## Memory of up to four 2x halfband filters (analog.Halfband, 12 each).
+    pub var bands: f32[48]
+
+## One node's call: its inputs (an unwired one is silence), outputs,
+## parameters, and the voice's gate for a kind that falls back on it.
+pub struct Ports:
+    pub var inputs: Signal[8]
+    pub var wired: bool[8]
+    pub var outputs: Samples[4]
+    pub var params: f32[16]
+    pub var frames: usize
+    pub var rate: f32
+    pub var gate: Signal
+    ## The song position (beats) at this block's first sample and the beats
+    ## each sample advances: what tempo-synced kinds follow. Stopped, the
+    ## position still runs (at the tempo) so a synced LFO keeps moving.
+    pub var beat: f64
+    pub var beats_per_sample: f64
+    ## The scale of the track running (`scale.Scale`): what a quantizer
+    ## following its track snaps to.
+    pub var scale_root: i32
+    pub var scale_mask: u32
+
+# ---------------------------------------------------------------- math
+
+pub inline func floorf(x: f32) -> f32:
+    let t = (f32)(i32)x
+    return t - 1.0 if t > x else t
+
+pub inline func clampf(x: f32, low: f32, high: f32) -> f32:
+    if x < low: return low
+    if x > high: return high
+    return x
+
+pub inline func absf(x: f32) -> f32:
+    return -x if x < 0.0 else x
+
+## 2^x, within 2e-5 relative (0.03 cents as a pitch).
+pub inline func exp2(x: f32) -> f32:
+    var v = x
+    if v < -126.0: v = -126.0
+    if v > 126.0: v = 126.0
+    let whole = floorf(v)
+    let f = v - whole
+    let p = 1.0 + f * (0.6931472 + f * (0.2402265 + f * (0.05550411 + f * (0.009618129 + f * (0.001333356 + f * 0.0001540353)))))
+    return p * f32.bits((u32)((i32)whole + 127) << 23)
+
+## sin(2πp): `p` in turns, any value; within 4e-6.
+pub inline func sin_turns(p: f32) -> f32:
+    var x = p - floorf(p + 0.5)
+    if x > 0.25: x = 0.5 - x
+    elif x < -0.25: x = -0.5 - x
+    let y = x * 6.2831855
+    let y2 = y * y
+    return y * (1.0 + y2 * (-0.16666667 + y2 * (0.008333333 + y2 * (-0.0001984127 + y2 * 0.0000027557319))))
+
+## tan(2πp) for `p` in [0, 0.24].
+pub inline func tan_turns(p: f32) -> f32:
+    return sin_turns(p) / sin_turns(p + 0.25)
+
+## A smooth saturation curve, tanh's shape: 1 at 3 and above.
+pub inline func soft_clip(x: f32) -> f32:
+    if x > 3.0: return 1.0
+    if x < -3.0: return -1.0
+    let x2 = x * x
+    return x * (27.0 + x2) / (27.0 + 9.0 * x2)
+
+## Decibels as a gain.
+pub inline func decibels(db: f32) -> f32:
+    return exp2(db * 0.16609640)
+
+## The coefficient a one-pole follower multiplies by each sample to fall
+## to a thousandth (-60 dB) in `seconds`.
+pub inline func fall(seconds: f32, rate: f32) -> f32:
+    let samples = seconds * rate
+    if samples < 1.0: return 0.0
+    return exp2(-9.965784 / samples)
+
+## The next number of a 32-bit xorshift, as -1..1.
+pub inline func white(seed: u32*) -> f32:
+    var x = *seed
+    if x == 0: x = 0x9E3779B9
+    x ^= x << 13
+    x ^= x >> 17
+    x ^= x << 5
+    *seed = x
+    return (f32)(x >> 8) * (2.0 / 16777216.0) - 1.0
+
+## Two-sample polynomial correction of a step at phase 0 (PolyBLEP).
+inline func blep(t: f32, dt: f32) -> f32:
+    if t < dt:
+        let x = t / dt
+        return x + x - x * x - 1.0
+    if t > 1.0 - dt:
+        let x = (t - 1.0) / dt
+        return x * x + x + x + 1.0
+    return 0.0
+
+# ---------------------------------------------------------------- kinds
+
+## Cycles a sample of middle C at 1 Hz sampling: scaled by the rate.
+let middle_c: f32 = 261.62558
+
+pub func oscillator(s: State*, p: Ports*):
+    let wave = (i32)p.params[0]
+    let tune = p.params[1] + p.params[2] / 12.0 + p.params[3] / 1200.0
+    let level = p.params[4]
+    let width = p.params[5]
+    let out = p.outputs[0]
+    let pitch = p.inputs[0]
+    let modulation = p.inputs[1]
+    let widths = p.inputs[2]
+    let step = middle_c / p.rate
+    var phase = (f32)s.a
+    var inc = clampf(step * exp2(tune), 0.0, 0.45)
+    for i in 0..<p.frames:
+        if p.wired[0]:
+            inc = clampf(step * exp2(tune + pitch[i]), 0.0, 0.45)
+        var t = phase
+        if p.wired[1]:
+            t = t + modulation[i]
+            t = t - floorf(t)
+        var value: f32 = 0.0
+        if wave == 0:
+            value = sin_turns(t)
+        elif wave == 1:
+            value = 4.0 * absf(t - 0.5) - 1.0
+        elif wave == 2:
+            value = 2.0 * t - 1.0 - blep(t, inc)
+        else:
+            var w = width
+            if p.wired[2]: w = clampf(width + widths[i] * 0.5, 0.02, 0.98)
+            var shifted = t + 1.0 - w
+            shifted = shifted - floorf(shifted)
+            value = (1.0 if t < w else -1.0) + blep(t, inc) - blep(shifted, inc)
+        out[i] = value * level
+        phase += inc
+        if phase >= 1.0: phase -= 1.0
+    s.a = (f64)phase
+
+pub func noise(s: State*, p: Ports*):
+    let level = p.params[0]
+    let out = p.outputs[0]
+    var seed = s.seed
+    for i in 0..<p.frames:
+        out[i] = white(&seed) * level
+    s.seed = seed
+
+## Cytomic's trapezoidal state-variable filter (Simper, 2013).
+pub func filter(s: State*, p: Ports*):
+    let mode = (i32)p.params[0]
+    let cutoff = p.params[1]
+    let resonance = p.params[2]
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let reson = p.inputs[2]
+    let out = p.outputs[0]
+    let top = p.rate * 0.45
+    let half = 0.5 / p.rate
+    var ic1 = (f32)s.a
+    var ic2 = (f32)s.b
+    var g = tan_turns(clampf(cutoff, 10.0, top) * half)
+    var k = 2.0 - 2.0 * clampf(resonance, 0.0, 0.98)
+    var a1 = 1.0 / (1.0 + g * (g + k))
+    var a2 = g * a1
+    var a3 = g * a2
+    let modulated = p.wired[1] or p.wired[2]
+    for i in 0..<p.frames:
+        if modulated:
+            var fc = cutoff
+            if p.wired[1]: fc = cutoff * exp2(moves[i])
+            var r = resonance
+            if p.wired[2]: r = resonance + reson[i]
+            g = tan_turns(clampf(fc, 10.0, top) * half)
+            k = 2.0 - 2.0 * clampf(r, 0.0, 0.98)
+            a1 = 1.0 / (1.0 + g * (g + k))
+            a2 = g * a1
+            a3 = g * a2
+        let v0 = source[i]
+        let v3 = v0 - ic2
+        let v1 = a1 * ic1 + a2 * v3
+        let v2 = ic2 + a2 * ic1 + a3 * v3
+        ic1 = 2.0 * v1 - ic1
+        ic2 = 2.0 * v2 - ic2
+        if mode == 0:
+            out[i] = v2
+        elif mode == 1:
+            out[i] = v1
+        elif mode == 2:
+            out[i] = v0 - k * v1 - v2
+        else:
+            out[i] = v0 - k * v1
+    s.a = (f64)ic1
+    s.b = (f64)ic2
+
+pub let idle: u32 = 0
+let attacking: u32 = 1
+let decaying: u32 = 2
+let sustaining: u32 = 3
+let releasing: u32 = 4
+
+## ADSR: a linear attack, exponential decay and release. An unwired gate
+## follows the voice's.
+pub func envelope(s: State*, p: Ports*):
+    let rise = 1.0 / (clampf(p.params[0], 0.0005, 30.0) * p.rate)
+    let decay = fall(p.params[1], p.rate)
+    let sustain = clampf(p.params[2], 0.0, 1.0)
+    let release = fall(p.params[3], p.rate)
+    let gate = p.inputs[0] if p.wired[0] else p.gate
+    let out = p.outputs[0]
+    var level = (f32)s.a
+    var held = s.b > 0.5
+    var stage = s.stage
+    for i in 0..<p.frames:
+        let on = gate[i] > 0.5
+        if on and not held:
+            stage = attacking
+        elif held and not on:
+            stage = releasing
+        held = on
+        if stage == attacking:
+            level += rise
+            if level >= 1.0:
+                level = 1.0
+                stage = decaying
+        elif stage == decaying:
+            level = sustain + (level - sustain) * decay
+            if level - sustain < 0.0001:
+                level = sustain
+                stage = sustaining
+        elif stage == sustaining:
+            level = sustain
+        elif stage == releasing:
+            level *= release
+            if level < 0.0001:
+                level = 0.0
+                stage = idle
+        out[i] = level
+    s.a = (f64)level
+    s.b = 1.0 if held else 0.0
+    s.stage = stage
+
+pub func lfo(s: State*, p: Ports*):
+    let wave = (i32)p.params[0]
+    let rate = p.params[1]
+    let depth = p.params[2]
+    let moves = p.inputs[0]
+    let out = p.outputs[0]
+    var phase = (f32)s.a
+    var held = (f32)s.b
+    var seed = s.seed
+    let inc = rate / p.rate
+    for i in 0..<p.frames:
+        var step = inc
+        if p.wired[0]: step = inc * exp2(moves[i])
+        var value: f32 = 0.0
+        if wave == 0:
+            value = sin_turns(phase)
+        elif wave == 1:
+            value = 1.0 - 4.0 * absf(phase - 0.5)
+        elif wave == 2:
+            value = 2.0 * phase - 1.0
+        elif wave == 3:
+            value = 1.0 if phase < 0.5 else -1.0
+        else:
+            value = held
+        out[i] = value * depth
+        phase += step
+        if phase >= 1.0:
+            phase -= floorf(phase)
+            held = white(&seed)
+    s.a = (f64)phase
+    s.b = (f64)held
+    s.seed = seed
+
+pub func mix(s: State*, p: Ports*):
+    let out = p.outputs[0]
+    for i in 0..<p.frames: out[i] = 0.0
+    for port in 0..<4:
+        if p.wired[port]:
+            let source = p.inputs[port]
+            let level = p.params[port]
+            for i in 0..<p.frames:
+                out[i] += source[i] * level
+
+pub func multiply(s: State*, p: Ports*):
+    let out = p.outputs[0]
+    let a = p.inputs[0]
+    let b = p.inputs[1]
+    if p.wired[1]:
+        for i in 0..<p.frames: out[i] = a[i] * b[i]
+    else:
+        for i in 0..<p.frames: out[i] = a[i]
+
+pub func gain(s: State*, p: Ports*):
+    let out = p.outputs[0]
+    let source = p.inputs[0]
+    let amount = p.inputs[1]
+    let level = decibels(p.params[0])
+    if p.wired[1]:
+        for i in 0..<p.frames: out[i] = source[i] * level * amount[i]
+    else:
+        for i in 0..<p.frames: out[i] = source[i] * level
+
+## Equal-power panning: -1 left, 1 right.
+pub func pan(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let moves = p.inputs[1]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let setting = p.params[0]
+    var l = sin_turns((1.0 - setting) * 0.125 + 0.0)
+    var r = sin_turns((1.0 + setting) * 0.125)
+    for i in 0..<p.frames:
+        if p.wired[1]:
+            let at = clampf(setting + moves[i], -1.0, 1.0)
+            l = sin_turns((1.0 - at) * 0.125)
+            r = sin_turns((1.0 + at) * 0.125)
+        left[i] = source[i] * l
+        right[i] = source[i] * r
+
+pub func drive(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let out = p.outputs[0]
+    let level = decibels(p.params[0])
+    let wet = p.params[1]
+    let makeup = 1.0 / soft_clip(level) if level > 1.0 else 1.0
+    for i in 0..<p.frames:
+        let x = source[i]
+        out[i] = x + (soft_clip(x * level) * makeup - x) * wet
+
+## The samples a delay line holds for `seconds` at `rate`, rounded up.
+pub func line_length(seconds: f64, rate: f64) -> usize:
+    return (usize)(seconds * rate) + 4
+
+pub func delay(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let out = p.outputs[0]
+    let line = s.line
+    if line.length < 4:
+        for i in 0..<p.frames: out[i] = source[i]
+        return
+    let size = (f32)line.length
+    let distance = clampf(p.params[0] * 0.001 * p.rate, 1.0, size - 2.0)
+    let feedback = clampf(p.params[1], 0.0, 0.98)
+    let wet = p.params[2]
+    var head = (usize)s.heads[0]
+    if head >= line.length: head = 0
+    for i in 0..<p.frames:
+        var back = (f32)head - distance
+        if back < 0.0: back += size
+        # f32 rounding can land `back` on `size` itself: wrap it.
+        var whole = (usize)back
+        if whole >= line.length: whole = 0
+        let frac = dsp_fraction(back, whole)
+        let next = whole + 1 if whole + 1 < line.length else 0
+        let echo = line[whole] + (line[next] - line[whole]) * frac
+        let x = source[i]
+        line[head] = x + echo * feedback
+        out[i] = x + (echo - x) * wet
+        head += 1
+        if head >= line.length: head = 0
+    s.heads[0] = (u32)head
+
+inline func dsp_fraction(position: f32, whole: usize) -> f32:
+    return clampf(position - (f32)whole, 0.0, 1.0)
+
+pub func constant(s: State*, p: Ports*):
+    let out = p.outputs[0]
+    let value = p.params[0]
+    for i in 0..<p.frames: out[i] = value
+
+pub func glide(s: State*, p: Ports*):
+    let source = p.inputs[0]
+    let out = p.outputs[0]
+    let keep = fall(p.params[0], p.rate)
+    var y = (f32)s.a
+    if s.stage == 0 and p.frames > 0:
+        y = source[0]
+        s.stage = 1
+    for i in 0..<p.frames:
+        y = source[i] + (y - source[i]) * keep
+        out[i] = y
+    s.a = (f64)y
+
+## The reverb's eight lines, in samples at 44.1 kHz (Freeverb's combs).
+let reverb_lines: u32[8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617]
+
+## The samples a reverb at `rate` needs.
+pub func reverb_length(rate: f64) -> usize:
+    var total: usize = 0
+    for length in reverb_lines:
+        total += (usize)(f64(length) * rate / 44100.0) + 1
+    return total
+
+## A feedback delay network: eight damped lines mixed through a Householder
+## matrix, fed the mono sum and read out alternately to left and right.
+pub func reverb(s: State*, p: Ports*):
+    let left_in = p.inputs[0]
+    let right_in = p.inputs[1] if p.wired[1] else p.inputs[0]
+    let left = p.outputs[0]
+    let right = p.outputs[1]
+    let line = s.line
+    let size = clampf(p.params[0], 0.0, 1.0)
+    let feedback = 0.7 + 0.28 * size
+    let damping = clampf(p.params[1], 0.0, 1.0) * 0.7
+    let wet = p.params[2]
+    var lengths: usize[8]
+    var starts: usize[8]
+    var at: usize = 0
+    for k in 0..<8:
+        starts[k] = at
+        lengths[k] = (usize)(f32(reverb_lines[k]) * p.rate / 44100.0) + 1
+        at += lengths[k]
+    if at > line.length:
+        for i in 0..<p.frames:
+            left[i] = left_in[i]
+            right[i] = right_in[i]
+        return
+    var taps: f32[8]
+    for i in 0..<p.frames:
+        let x = (left_in[i] + right_in[i]) * 0.5
+        var sum: f32 = 0.0
+        for k in 0..<8:
+            var head = (usize)s.heads[k]
+            if head >= lengths[k]: head = 0
+            let value = line[starts[k] + head]
+            s.damp[k] = value + (s.damp[k] - value) * damping
+            taps[k] = s.damp[k]
+            sum += taps[k]
+        let spread = sum * 0.25
+        var l: f32 = 0.0
+        var r: f32 = 0.0
+        for k in 0..<8:
+            var head = (usize)s.heads[k]
+            if head >= lengths[k]: head = 0
+            let signed = x if k % 2 == 0 else -x
+            line[starts[k] + head] = (taps[k] - spread) * feedback + signed * 0.35
+            head += 1
+            s.heads[k] = (u32)(head if head < lengths[k] else 0)
+            if k % 2 == 0: l += taps[k]
+            else: r += taps[k]
+        left[i] = left_in[i] + (l * 0.25 - left_in[i]) * wet
+        right[i] = right_in[i] + (r * 0.25 - right_in[i]) * wet
+
+test "the fast math agrees with the library's":
+    assert(absf(exp2(0.0) - 1.0) < 0.00001 and absf(exp2(1.0) - 2.0) < 0.0001 and absf(exp2(-1.0) - 0.5) < 0.00001)
+    assert(absf(exp2(10.5) - 1448.1547) < 0.05)
+    assert(absf(sin_turns(0.25) - 1.0) < 0.00001 and absf(sin_turns(0.75) + 1.0) < 0.00001)
+    assert(absf(sin_turns(0.125) - 0.70710678) < 0.00001 and absf(sin_turns(-0.125) + 0.70710678) < 0.00001)
+    assert(absf(tan_turns(0.125) - 1.0) < 0.0001)
+    assert(absf(decibels(-6.0206) - 0.5) < 0.0001)
+    assert(soft_clip(10.0) == 1.0 and absf(soft_clip(0.1) - 0.0996679) < 0.001)
+
+test "a saw oscillator at 480 Hz repeats every 100 samples at 48 kHz":
+    var state: State
+    var out: f32[64]
+    var ports: Ports
+    ports.params = [2.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ports.frames = 64
+    ports.rate = 48000.0
+    ports.outputs[0] = out
+    # middle C 261.63 Hz up to 480 Hz: log2(480 / 261.62558) octaves
+    ports.params[3] = 0.0
+    ports.params[1] = 0.8755
+    oscillator(&state, &ports)
+    # PolyBLEP rounds the step at phase 0; five samples on, the ramp is at -0.9.
+    assert(absf(out[5] - (-1.0 + 10.0 * 480.0 / 48000.0)) < 0.01)
+    var rising = 0
+    for i in 1..<64:
+        if out[i] > out[i - 1]: rising += 1
+    assert(rising >= 60)

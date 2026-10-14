@@ -1,0 +1,88 @@
+## Yamaha's FM: the DX7's operator as a node. Six of them wired as one of
+## its algorithms (modulators into the `mod` input of carriers, carriers
+## mixed) make a DX7 voice; four make a DX21/TX81Z. Chowning's phase
+## modulation: an operator's output, in turns, shifts the phase of the one it
+## feeds. Nothing here allocates or traps.
+import dsp
+import models
+from dsp import State, Ports, clampf, absf, exp2, decibels
+
+## An FM operator: a sine at Ratio times the note (or Fixed Hz), its own
+## envelope (attack, then an exponential fall to sustain and release), its
+## phase pushed by `mod` (in turns: 1 is a full cycle, a strong index) and
+## by its own last output (Feedback: toward a saw, then noise). Level is
+## its output: a carrier's loudness, a modulator's index. Velocity and Key
+## Scale make it softer for soft notes and high keys, as the DX7's did.
+## The phase restarts at each note, as the DX7's oscillator sync did.
+## Inputs: pitch (octaves), gate, velocity, mod (turns).
+## Params: Ratio, Detune (cents), Level, Attack (s), Decay (s), Sustain,
+## Release (s), Feedback, Velocity, Key Scale, Fixed (Hz, 0 off).
+pub func operator(s: State*, p: Ports*):
+    let pitch = p.inputs[0]
+    let gate = p.inputs[1] if p.wired[1] else p.gate
+    let velocity = p.inputs[2]
+    let mods = p.inputs[3]
+    let out = p.outputs[0]
+    let ratio = clampf(p.params[0], 0.125, 32.0)
+    let detune = exp2(clampf(p.params[1], -100.0, 100.0) / 1200.0)
+    let level = clampf(p.params[2], 0.0, 4.0)
+    let attack = clampf(p.params[3], 0.0005, 20.0)
+    let decay = clampf(p.params[4], 0.005, 60.0)
+    let sustain = clampf(p.params[5], 0.0, 1.0)
+    let release = clampf(p.params[6], 0.005, 60.0)
+    let feedback = clampf(p.params[7], 0.0, 1.0) * 0.3
+    let sensitivity = clampf(p.params[8], 0.0, 1.0)
+    let key_scale = clampf(p.params[9], 0.0, 1.0)
+    let fixed = p.params[10]
+    let fall = dsp.fall(decay, p.rate)
+    let let_go = dsp.fall(release, p.rate)
+    let rise = 1.0 / (attack * p.rate)
+    var phase = (f32)s.a
+    var env = (f32)s.b
+    var held = (f32)s.c
+    var strength = (f32)s.d
+    var last = s.damp[0]
+    var before = s.damp[1]
+    var stage = s.stage
+    for i in 0..<p.frames:
+        if models.struck(gate, i, &held):
+            stage = 1
+            phase = 0.0
+            let v = clampf(velocity[i], 0.0, 1.0) if p.wired[2] else 0.8
+            strength = 1.0 - sensitivity * (1.0 - v)
+        elif held < 0.5 and stage != 0:
+            stage = 3
+        var octaves: f32 = 0.0
+        if p.wired[0]: octaves = pitch[i]
+        var hz = fixed if fixed > 0.0 else 261.62558 * exp2(octaves) * ratio
+        hz = hz * detune
+        # The envelope: a straight rise, an exponential fall to Sustain,
+        # then to silence.
+        if stage == 1:
+            env += rise
+            if env >= 1.0:
+                env = 1.0
+                stage = 2
+        elif stage == 2:
+            env = sustain + (env - sustain) * fall
+        elif stage == 3:
+            env = env * let_go
+            if env < 0.00001:
+                env = 0.0
+                stage = 0
+        var push = feedback * 0.5 * (last + before)
+        if p.wired[3]: push += mods[i]
+        let y = dsp.sin_turns(phase + push)
+        phase += clampf(hz / p.rate, 0.0, 0.49)
+        if phase >= 1.0: phase -= 1.0
+        before = last
+        last = y
+        let scale = decibels(-6.0 * key_scale * (octaves if octaves > 0.0 else 0.0))
+        out[i] = y * env * level * strength * scale
+    s.a = (f64)phase
+    s.b = (f64)env
+    s.c = (f64)held
+    s.d = (f64)strength
+    s.damp[0] = last
+    s.damp[1] = before
+    s.stage = stage

@@ -1,0 +1,303 @@
+## Render single-node test patches to WAV for measuring by ear or by
+## tools (luced-music/tools/analyze.py): `lab DIR [case ...]`.
+## Each case is a small patch played by a note lane; see `cases`.
+import strings
+import kinds
+from luce_audio import engine
+from luce_audio.engine import Engine
+
+## A patch under test: its unit index and the node indices it built.
+struct Bench:
+    var engine: Engine*
+    var track: i64
+    var unit: i64
+    var lane: i64
+    var next_id: i64
+
+    func node(kind: u32) -> i64!:
+        self.next_id += 1
+        return try self.engine.add_node(self.unit, self.next_id, (i64)kind)
+
+    func wire(source: i64, output: i64, target: i64, input: i64) -> !:
+        try self.engine.wire(source, output, target, input)
+
+    func set(node: i64, slot: i64, value: f64):
+        self.engine.node_param(node, slot, value)
+
+    func note(start: f64, length: f64, pitch: i64, velocity: f64 = 1.0) -> !:
+        try self.engine.add_note(self.lane, start, length, pitch, velocity, 0.0)
+
+func open_bench(e: Engine*, voices: i64) -> Bench!:
+    e.begin()
+    let track = try e.add_track(1, 2, 1.0, 0.0, false, false)
+    let voice = try e.add_unit(track, 10, voices, true)
+    let lane = try e.add_lane(track, 20, false)
+    try e.play_notes(lane, voice)
+    return Bench(engine = e, track = track, unit = voice, lane = lane, next_id = 1000)
+
+func finish(e: Engine*, directory: str, name: str, seconds: f64) -> !:
+    try e.commit()
+    e.seek(0.0)
+    e.play()
+    try e.render((i64)(seconds * 48000.0))
+    var path: u8[512]
+    let file = try strings.format(path, f"{directory}/{name}.wav")
+    try e.export_wav(file)
+    print(f"{name}: {seconds} s, RMS {e.level(0)}")
+
+## A saw at A2 into `kind` with params, swept by a 4-octave envelope.
+func filter_sweep(e: Engine*, directory: str, name: str, kind: u32, resonance_slot: i64, resonance: f64, cutoff_slot: i64 = 0) -> !:
+    var b = try open_bench(e, 1)
+    let note = try b.node(kinds.note_in)
+    let saw = try b.node(kinds.oscillator)
+    let sweep = try b.node(kinds.envelope)
+    let depth = try b.node(kinds.mix)
+    let filter = try b.node(kind)
+    let out = try b.node(kinds.output)
+    b.set(saw, 0, 2.0)
+    b.set(sweep, 0, 2.0)
+    b.set(sweep, 1, 2.0)
+    b.set(sweep, 2, 0.0)
+    b.set(depth, 0, 6.0)
+    b.set(filter, resonance_slot, resonance)
+    b.set(filter, cutoff_slot, 100.0)
+    try b.wire(note, 0, saw, 0)
+    try b.wire(saw, 0, filter, 0)
+    try b.wire(sweep, 0, depth, 0)
+    try b.wire(depth, 0, filter, 1)
+    try b.wire(filter, 0, out, 0)
+    try b.note(0.0, 7.0, 45)
+    try finish(e, directory, name, 4.0)
+
+## A diode ladder at 440 Hz with no input, resonance `res`.
+func diode_alone(e: Engine*, directory: str, name: str, res: f64) -> !:
+    var b = try open_bench(e, 1)
+    let filter = try b.node(kinds.diode_ladder)
+    let out = try b.node(kinds.output)
+    let note = try b.node(kinds.note_in)
+    b.set(filter, 0, 440.0)
+    b.set(filter, 1, res)
+    b.set(filter, 5, 0.0)
+    b.set(filter, 4, 5.0 if res > 1.02 else 80.0)
+    try b.wire(filter, 0, out, 0)
+    try b.note(0.0, 7.0, 45)
+    try finish(e, directory, name, 2.0)
+
+## A ladder at 440 Hz and resonance 1 with no input: it sings by itself.
+func ladder_alone(e: Engine*, directory: str) -> !:
+    var b = try open_bench(e, 1)
+    let filter = try b.node(kinds.ladder)
+    let out = try b.node(kinds.output)
+    let note = try b.node(kinds.note_in)
+    b.set(filter, 0, 440.0)
+    b.set(filter, 1, 1.0)
+    b.set(filter, 5, 0.0)
+    try b.wire(filter, 0, out, 0)
+    try b.note(0.0, 7.0, 45)
+    try finish(e, directory, "ladder_self_oscillation", 2.0)
+
+## One held note of `kind` (an oscillator) with params, for aliasing.
+func tone(e: Engine*, directory: str, name: str, kind: u32, pitch: i64, settings: const f64[]) -> !:
+    var b = try open_bench(e, 1)
+    let note = try b.node(kinds.note_in)
+    let source = try b.node(kind)
+    let out = try b.node(kinds.output)
+    var slot: i64 = 0
+    while slot + 1 < (i64)settings.length:
+        b.set(source, (i64)settings[(usize)slot], settings[(usize)slot + 1])
+        slot += 2
+    try b.wire(note, 0, source, 0)
+    try b.wire(source, 0, out, 0)
+    try b.note(0.0, 4.0, pitch)
+    try finish(e, directory, name, 2.0)
+
+## A sine at C6 (1046.5 Hz) through Drive circuit `circuit`: its harmonics,
+## and what folds back.
+func drive_test(e: Engine*, directory: str, name: str, circuit: f64) -> !:
+    var b = try open_bench(e, 1)
+    let note = try b.node(kinds.note_in)
+    let sine = try b.node(kinds.oscillator)
+    let shaper = try b.node(kinds.drive2)
+    let out = try b.node(kinds.output)
+    b.set(sine, 0, 0.0)
+    b.set(sine, 4, 0.7)
+    b.set(shaper, 0, circuit)
+    b.set(shaper, 1, 24.0)
+    b.set(shaper, 4, 20000.0)
+    try b.wire(note, 0, sine, 0)
+    try b.wire(sine, 0, shaper, 0)
+    try b.wire(shaper, 0, out, 0)
+    try b.note(0.0, 4.0, 84)
+    try finish(e, directory, name, 2.0)
+
+## Drum `kind` hit four times, a beat apart, louder each time.
+func drum(e: Engine*, directory: str, name: str, kind: u32, settings: const f64[]) -> !:
+    var b = try open_bench(e, 4)
+    let note = try b.node(kinds.note_in)
+    let voice = try b.node(kind)
+    let out = try b.node(kinds.output)
+    var slot: i64 = 0
+    while slot + 1 < (i64)settings.length:
+        b.set(voice, (i64)settings[(usize)slot], settings[(usize)slot + 1])
+        slot += 2
+    try b.wire(note, 1, voice, 0)
+    try b.wire(note, 2, voice, 1)
+    try b.wire(voice, 0, out, 0)
+    for k in 0..<4:
+        try b.note((f64)k, 0.25, 60, 0.4 + 0.2 * (f64)k)
+    try finish(e, directory, name, 2.4)
+
+## Rhodes notes across the keyboard, soft and hard.
+func rhodes(e: Engine*, directory: str) -> !:
+    var b = try open_bench(e, 8)
+    let note = try b.node(kinds.note_in)
+    let piano = try b.node(kinds.tine)
+    let out = try b.node(kinds.output)
+    try b.wire(note, 0, piano, 0)
+    try b.wire(note, 1, piano, 1)
+    try b.wire(note, 2, piano, 2)
+    try b.wire(piano, 0, out, 0)
+    try b.note(0.0, 1.5, 48, 0.3)
+    try b.note(2.0, 1.5, 48, 1.0)
+    try b.note(4.0, 1.5, 60, 0.3)
+    try b.note(6.0, 1.5, 60, 1.0)
+    try b.note(8.0, 1.5, 72, 0.3)
+    try b.note(10.0, 1.5, 72, 1.0)
+    try finish(e, directory, "rhodes", 6.5)
+
+## A plucked saw (two short notes) into effect `kind`, out in stereo.
+func fx(e: Engine*, directory: str, name: str, kind: u32, settings: const f64[], seconds: f64) -> !:
+    var b = try open_bench(e, 2)
+    let note = try b.node(kinds.note_in)
+    let saw = try b.node(kinds.analog_vco)
+    let shape = try b.node(kinds.analog_envelope)
+    let amp = try b.node(kinds.multiply)
+    let effect = try b.node(kind)
+    let out = try b.node(kinds.output)
+    b.set(saw, 7, 0.0)
+    b.set(shape, 1, 0.15)
+    b.set(shape, 2, 0.0)
+    b.set(shape, 3, 0.1)
+    var slot: i64 = 0
+    while slot + 1 < (i64)settings.length:
+        b.set(effect, (i64)settings[(usize)slot], settings[(usize)slot + 1])
+        slot += 2
+    try b.wire(note, 0, saw, 0)
+    try b.wire(note, 1, shape, 0)
+    try b.wire(saw, 0, amp, 0)
+    try b.wire(shape, 0, amp, 1)
+    try b.wire(amp, 0, effect, 0)
+    try b.wire(amp, 0, effect, 1)
+    try b.wire(effect, 0, out, 0)
+    try b.wire(effect, 1, out, 1)
+    try b.note(0.0, 0.2, 57)
+    try b.note(0.5, 0.2, 64)
+    try finish(e, directory, name, seconds)
+
+## A held sine at A4 (440 Hz) through `kind`: wow, pumping, a long tail.
+func steady(e: Engine*, directory: str, name: str, kind: u32, settings: const f64[], seconds: f64) -> !:
+    var b = try open_bench(e, 1)
+    let note = try b.node(kinds.note_in)
+    let sine = try b.node(kinds.oscillator)
+    let effect = try b.node(kind)
+    let out = try b.node(kinds.output)
+    b.set(sine, 0, 0.0)
+    var slot: i64 = 0
+    while slot + 1 < (i64)settings.length:
+        b.set(effect, (i64)settings[(usize)slot], settings[(usize)slot + 1])
+        slot += 2
+    try b.wire(note, 0, sine, 0)
+    try b.wire(sine, 0, effect, 0)
+    try b.wire(sine, 0, effect, 1)
+    try b.wire(effect, 0, out, 0)
+    try b.wire(effect, 1, out, 1)
+    try b.note(0.0, 64.0, 69)
+    try finish(e, directory, name, seconds)
+
+## A stereo source (the supersaw) held at A3.
+func stereo_tone(e: Engine*, directory: str, name: str, kind: u32, settings: const f64[]) -> !:
+    var b = try open_bench(e, 1)
+    let note = try b.node(kinds.note_in)
+    let source = try b.node(kind)
+    let out = try b.node(kinds.output)
+    var slot: i64 = 0
+    while slot + 1 < (i64)settings.length:
+        b.set(source, (i64)settings[(usize)slot], settings[(usize)slot + 1])
+        slot += 2
+    try b.wire(note, 0, source, 0)
+    try b.wire(source, 0, out, 0)
+    try b.wire(source, 1, out, 1)
+    try b.note(0.0, 8.0, 57)
+    try finish(e, directory, name, 2.0)
+
+func studio_cases(e: Engine*, directory: str) -> !:
+    try steady(e, directory, "tape_studio", kinds.tape, [2.0, 1.0, 3.0, 1.0, 6.0, -120.0], 6.0)
+    try steady(e, directory, "tape_cassette", kinds.tape, [0.0, 1.0, 2.0, 1.0, 3.0, 1.0, 6.0, -120.0], 6.0)
+    try steady(e, directory, "tape_vhs", kinds.tape, [0.0, 2.0, 2.0, 1.0, 3.0, 1.0, 6.0, -120.0], 6.0)
+    try steady(e, directory, "pump_quarter", kinds.pump, [1.0, 0.6], 4.0)
+    try stereo_tone(e, directory, "supersaw", kinds.supersaw, [7.0, 0.0])
+    try stereo_tone(e, directory, "supersaw_c7", kinds.supersaw, [0.0, 2.0, 7.0, 0.0])
+    try fx(e, directory, "hall_3s", kinds.hall, [0.0, 3.0, 9.0, 1.0], 8.0)
+    let machine = ["kick", "snare", "tom", "hat", "open_hat", "clap", "rim", "tambourine", "shaker", "cowbell"]
+    for m in 0..<machine.length:
+        var label: u8[64]
+        let name = try strings.format(label, f"linn_{machine[m]}")
+        try drum(e, directory, name, kinds.drum_machine, [0.0, (f64)m])
+    try steady(e, directory, "shift_up_100", kinds.freq_shifter, [0.0, 100.0, 2.0, 0.0, 3.0, 1.0], 2.0)
+    try fx(e, directory, "hall_shimmer", kinds.hall, [0.0, 6.0, 9.0, 1.0, 10.0, 0.8], 8.0)
+    try fx(e, directory, "hall_gated", kinds.hall, [0.0, 3.0, 8.0, 0.3, 9.0, 1.0], 3.0)
+
+pub func main(arguments: str[]) -> i32!:
+    let directory = arguments[1] if arguments.length > 1 else "."
+    var e = try engine.create(48000.0)
+    defer e.close()
+    if arguments.length > 2 and arguments[2] == "studio":
+        try studio_cases(&e, directory)
+        return 0
+    try filter_sweep(&e, directory, "svf_sweep", kinds.filter, 2, 0.9)
+    try filter_sweep(&e, directory, "ladder_res30", kinds.ladder, 1, 0.3)
+    try filter_sweep(&e, directory, "ladder_res90", kinds.ladder, 1, 0.9)
+    try filter_sweep(&e, directory, "ladder_res100", kinds.ladder, 1, 1.0)
+    try ladder_alone(&e, directory)
+    try filter_sweep(&e, directory, "sem_res90", kinds.sem, 1, 0.9)
+    try filter_sweep(&e, directory, "sem_res105", kinds.sem, 1, 1.05)
+    try filter_sweep(&e, directory, "cs_res80", kinds.twin, 3, 0.8, 2)
+    try filter_sweep(&e, directory, "ms20_peak95", kinds.ms20, 3, 0.95, 2)
+    try filter_sweep(&e, directory, "ms20_peak100", kinds.ms20, 3, 1.0, 2)
+    # C7 (2093 Hz): where aliasing shows. Drift 0 so the pitch is exact.
+    try tone(&e, directory, "osc_naive_triangle", kinds.oscillator, 96, [0.0, 1.0, 4.0, 0.5])
+    try tone(&e, directory, "osc_naive_saw_blep", kinds.oscillator, 96, [0.0, 2.0, 4.0, 0.5])
+    try tone(&e, directory, "vco_triangle", kinds.analog_vco, 96, [3.0, 0.0, 7.0, 0.0])
+    try tone(&e, directory, "vco_saw", kinds.analog_vco, 96, [3.0, 0.5, 7.0, 0.0])
+    try tone(&e, directory, "vco_pulse", kinds.analog_vco, 96, [3.0, 1.0, 7.0, 0.0])
+    try tone(&e, directory, "vco_pulse_narrow", kinds.analog_vco, 96, [3.0, 1.0, 4.0, 0.1, 7.0, 0.0])
+    try tone(&e, directory, "vco_shark", kinds.analog_vco, 96, [3.0, 0.0, 4.0, 0.85, 7.0, 0.0])
+    try tone(&e, directory, "vco_sub_saw", kinds.analog_vco, 72, [3.0, 0.5, 5.0, 0.7, 7.0, 0.0])
+    try rhodes(&e, directory)
+    try diode_alone(&e, directory, "diode_self_100", 1.0)
+    try diode_alone(&e, directory, "diode_self_105", 1.05)
+    try filter_sweep(&e, directory, "diode_res85", kinds.diode_ladder, 1, 0.85)
+    try fx(&e, directory, "lofi", kinds.lofi, [0.0, 6.0, 1.0, 6000.0], 2.0)
+    try fx(&e, directory, "phaser", kinds.phaser, [1.0, 0.8], 2.0)
+    try fx(&e, directory, "flanger", kinds.flanger, [2.0, 0.5], 2.0)
+    try fx(&e, directory, "plate_3s", kinds.plate, [0.0, 3.0, 8.0, 1.0], 6.0)
+    try fx(&e, directory, "plate_bladerunner", kinds.plate, [0.0, 14.0, 1.0, 1.6, 3.0, 0.5, 5.0, 0.8, 8.0, 1.0, 9.0, 1.0], 12.0)
+    try fx(&e, directory, "echo_tape", kinds.echo, [3.0, 1.0], 4.0)
+    try fx(&e, directory, "echo_bbd_pingpong", kinds.echo, [0.0, 1.0, 3.0, 1.0, 9.0, 1.0], 4.0)
+    try fx(&e, directory, "chorus_juno2", kinds.chorus, [0.0, 1.0, 3.0, 1.0], 2.0)
+    try fx(&e, directory, "chorus_ensemble", kinds.chorus, [0.0, 4.0, 3.0, 1.0], 2.0)
+    try drum(&e, directory, "kick_808", kinds.kick, [0.0, 0.0])
+    try drum(&e, directory, "kick_909", kinds.kick, [0.0, 1.0, 1.0, 55.0, 2.0, 0.35, 3.0, 2.0, 4.0, 0.03])
+    try drum(&e, directory, "snare_808", kinds.snare, [0.0, 0.0])
+    try drum(&e, directory, "snare_909", kinds.snare, [0.0, 1.0, 1.0, 200.0])
+    try drum(&e, directory, "tom", kinds.snare, [0.0, 2.0, 1.0, 110.0, 2.0, 0.4, 6.0, 0.6])
+    try drum(&e, directory, "hat_closed", kinds.metal, [0.0, 0.0])
+    try drum(&e, directory, "cymbal", kinds.metal, [0.0, 1.0, 2.0, 1.5])
+    try drum(&e, directory, "cowbell", kinds.metal, [0.0, 2.0, 2.0, 0.3, 3.0, 0.45])
+    try drum(&e, directory, "clap", kinds.clap, [0.0, 0.011])
+    let circuits = ["boost", "tube", "tape", "mid", "diode", "fuzz", "square", "fold"]
+    for c in 0..<circuits.length:
+        var label: u8[64]
+        let name = try strings.format(label, f"drive_{c}_{circuits[c]}")
+        try drive_test(&e, directory, name, (f64)c)
+    return 0

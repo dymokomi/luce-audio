@@ -1,0 +1,58 @@
+## Plays a quiet 440 Hz tone on the default output for a few seconds and
+## reports what the device gave: its rate, buffer, latency, the callbacks
+## and the longest time one took. `probe 32` asks for 32-frame buffers.
+import time
+import thread
+import strings
+from luce_audio import device
+from luce_audio.device import Device, Block
+
+struct Tone:
+    var phase: f64
+    var step: f64
+    var calls: @u64
+    var frames_seen: @u64
+    var longest: @u64
+    var smallest: @u64
+    var largest: @u64
+
+func render(context: void*?, block: Block*):
+    let started = time.now()
+    let tone = (Tone*)(context else return)
+    let left = block.output(0)
+    var phase = tone.phase
+    for i in 0..<block.frames:
+        left[i] = (f32)(0.02 * fsin(phase))
+        phase += tone.step
+        if phase > 6.283185307179586: phase -= 6.283185307179586
+    tone.phase = phase
+    for channel in 1..<block.channels:
+        let out = block.output(channel)
+        for i in 0..<block.frames: out[i] = left[i]
+    tone.calls += 1
+    tone.frames_seen += (u64)block.frames
+    _ = tone.smallest.min((u64)block.frames, .relaxed)
+    _ = tone.largest.max((u64)block.frames, .relaxed)
+    _ = tone.longest.max(time.since(started), .relaxed)
+
+extern func sin(x: f64) -> f64
+func fsin(x: f64) -> f64:
+    return sin(x)
+
+pub func main(arguments: str[]) -> i32!:
+    var frames: u32 = 64
+    if arguments.length > 1:
+        frames = (u32)(strings.parse_i64(arguments[1]) else 64)
+    var tone = Tone(phase = 0.0, step = 0.0, calls = 0, frames_seen = 0, longest = 0, smallest = 1000000, largest = 0)
+    var output = try Device.open(render, &tone, frames = frames)
+    defer output.close()
+    tone.step = 6.283185307179586 * 440.0 / output.sample_rate
+    print(f"device {output.device_id}: {output.sample_rate} Hz, {output.buffer_frames} frames a buffer ({f64(output.buffer_frames) / output.sample_rate * 1000.0:.2f} ms), device latency {output.output_latency} frames")
+    try output.start()
+    thread.sleep(3000)
+    output.stop()
+    let calls = tone.calls.load(.acquire)
+    print(f"{calls} callbacks, {tone.frames_seen.load(.relaxed)} frames, buffers {tone.smallest.load(.relaxed)}..{tone.largest.load(.relaxed)} frames, longest callback {f64(tone.longest.load(.relaxed)) / 1000.0:.1f} us")
+    let total = f64(output.buffer_frames + output.output_latency) / output.sample_rate * 1000.0
+    print(f"output latency: {total:.2f} ms (buffer + device)")
+    return 0
