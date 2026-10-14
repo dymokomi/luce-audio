@@ -4,7 +4,7 @@ def package "luce-audio" {
     str version = "0.4.1"
     str kind = "package"
     str language = "luce-base"
-    str description = "Audio for Luce/Base programs: a realtime engine (tracks, instruments and effects built from node patches, analog and FM models, mixing and mastering, scales, live MIDI) on CoreAudio with duplex input, plus short PCM playback and an OPL2/IMF renderer. macOS first; elsewhere the device answers unsupported."
+    str description = "Audio for Luce/Base: a realtime engine (node-patch instruments and effects, analog and FM models, mixing, scales, live MIDI) on CoreAudio with duplex input, plus PCM playback and an OPL2/IMF renderer."
     str readme = "README.md"
     str[] public = ["audio", "device", "engine", "kinds", "analog", "dsp", "scale"]
 
