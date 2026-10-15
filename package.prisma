@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-audio" {
     str owner = "dymokomi"
-    str version = "0.4.1"
+    str version = "0.4.2"
     str kind = "package"
     str language = "luce-base"
     str description = "Audio for Luce/Base: a realtime engine (node-patch instruments and effects, analog and FM models, mixing, scales, live MIDI) on CoreAudio with duplex input, plus PCM playback and an OPL2/IMF renderer."
